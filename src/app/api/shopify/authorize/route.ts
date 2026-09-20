@@ -54,7 +54,7 @@ export async function POST(request: NextRequest) {
   // scopes intentionally left as the empty string for this connectivity spike
   // — see docs/PHASE2B2_PREFLIGHT_REPORT.md §2. Not silently defaulted to
   // read_products; the live result is what determines the next step.
-  authorizeUrl.searchParams.set("scope", process.env.SHOPIFY_SCOPES ?? "");
+  authorizeUrl.searchParams.set("scope", env.scopes);
   authorizeUrl.searchParams.set("redirect_uri", redirectUri);
   authorizeUrl.searchParams.set("state", nonce);
 

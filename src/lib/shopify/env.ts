@@ -9,6 +9,11 @@ import "server-only";
  * prefixed `NEXT_PUBLIC_*`, and this module carries `import "server-only"` so
  * an accidental import from a Client Component is a build-time error, not a
  * runtime credential leak.
+ *
+ * Required scalar values are trimmed at the boundary to guard against
+ * accidental CR/LF/whitespace contamination from platform env UIs or CLI
+ * pipelines. SHOPIFY_SCOPES is optional: missing/empty/whitespace-only values
+ * all resolve to the empty string, which is the Phase 2B zero-scope setting.
  */
 
 export interface ShopifyEnv {
@@ -16,15 +21,25 @@ export interface ShopifyEnv {
   clientSecret: string;
   appUrl: string;
   apiVersion: string;
+  scopes: string;
 }
 
-/** Returns Shopify OAuth settings, or `null` when not yet configured. */
+function trimOrNull(value: string | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Returns Shopify OAuth settings, or `null` when required values are not configured. */
 export function getShopifyEnv(): ShopifyEnv | null {
-  const clientId = process.env.SHOPIFY_CLIENT_ID;
-  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
-  const appUrl = process.env.SHOPIFY_APP_URL;
-  const apiVersion = process.env.SHOPIFY_API_VERSION;
+  const clientId = trimOrNull(process.env.SHOPIFY_CLIENT_ID);
+  const clientSecret = trimOrNull(process.env.SHOPIFY_CLIENT_SECRET);
+  const appUrl = trimOrNull(process.env.SHOPIFY_APP_URL);
+  const apiVersion = trimOrNull(process.env.SHOPIFY_API_VERSION);
 
   if (!clientId || !clientSecret || !appUrl || !apiVersion) return null;
-  return { clientId, clientSecret, appUrl, apiVersion };
+
+  const scopes = process.env.SHOPIFY_SCOPES?.trim() ?? "";
+
+  return { clientId, clientSecret, appUrl, apiVersion, scopes };
 }

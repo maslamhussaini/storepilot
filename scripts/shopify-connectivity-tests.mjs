@@ -256,6 +256,57 @@ test("env module: SHOPIFY_CLIENT_SECRET is never read outside src/lib/shopify", 
 });
 
 // ---------------------------------------------------------------------------
+// Shopify env normalization — Phase 2B.2b CRLF-defense
+// ---------------------------------------------------------------------------
+const ENV_MODULE = "src/lib/shopify/env.ts";
+
+function normalizeScopes(raw) {
+  return raw?.trim() ?? "";
+}
+
+test("env: SHOPIFY_SCOPES missing resolves to empty string", () => {
+  assert.equal(normalizeScopes(undefined), "");
+});
+test("env: SHOPIFY_SCOPES empty string resolves to empty string", () => {
+  assert.equal(normalizeScopes(""), "");
+});
+test("env: SHOPIFY_SCOPES CRLF-only resolves to empty string", () => {
+  assert.equal(normalizeScopes("\r\n"), "");
+});
+test("env: SHOPIFY_SCOPES whitespace-only resolves to empty string", () => {
+  assert.equal(normalizeScopes("  \t\n  "), "");
+});
+test("env: SHOPIFY_SCOPES with surrounding whitespace is trimmed", () => {
+  assert.equal(normalizeScopes("  read_products  "), "read_products");
+});
+test("env: required Shopify scalar values trim surrounding CR/LF", () => {
+  const src = readFileSync(ENV_MODULE, "utf8");
+  assert.ok(src.includes(".trim()"), "env.ts must trim required scalar values");
+  assert.ok(
+    src.includes("SHOPIFY_SCOPES?.trim()") || src.includes("scopes?.trim()"),
+    "env.ts must trim SHOPIFY_SCOPES",
+  );
+});
+test("env: required scalar becomes empty after trim => configuration error", () => {
+  const src = readFileSync(ENV_MODULE, "utf8");
+  assert.ok(
+    src.includes("if (!clientId || !clientSecret || !appUrl || !apiVersion) return null"),
+    "required scalars must still reject empty values after trim",
+  );
+});
+test("authorize route: generated zero-scope URL contains scope= with no CR/LF", () => {
+  const src = readFileSync("src/app/api/shopify/authorize/route.ts", "utf8");
+  assert.ok(
+    src.includes('authorizeUrl.searchParams.set("scope", env.scopes)'),
+    "authorize route must use env.scopes, not raw process.env",
+  );
+  assert.ok(
+    !src.includes('process.env.SHOPIFY_SCOPES'),
+    "authorize route must not read SHOPIFY_SCOPES directly from process.env",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Connect UI wiring (Phase 2B.2b): the demo button must be fully gone, and
 // the real endpoint must be used, via source inspection of the client view —
 // there's no JS test runner in this project to mount/render it (see the
