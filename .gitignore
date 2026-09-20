@@ -40,6 +40,7 @@ yarn-error.log*
 # local tooling / editor
 .vscode
 .mcp.json
+.kilo
 
 # typescript
 *.tsbuildinfo
