@@ -1,0 +1,20 @@
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "34f8bbeca60f2239f244adf1857a1668"
+# Replace with the real Vercel staging/production URL before deploying.
+application_url = "https://<YOUR-VERCEL-STAGING-URL>"
+embedded = false
+name = "StorePilot"
+
+[webhooks]
+api_version = "2026-07"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access-scopes
+scopes = ""
+optional_scopes = []
+use_legacy_install_flow = false
+
+[auth]
+# Replace with the real Vercel staging/production callback before deploying.
+redirect_urls = [ "https://<YOUR-VERCEL-STAGING-URL>/api/shopify/callback" ]

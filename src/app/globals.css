@@ -1,0 +1,206 @@
+@import "tailwindcss" source(none);
+
+/* Restrict Tailwind's candidate-class scanning to StorePilot's application
+   source tree only. Without this, Tailwind v4's automatic content detection
+   walks the whole project (respecting .gitignore) and treats every text
+   file — including docs/*.md — as scannable source, so example code spans
+   in documentation can be misread as real utility classes and break the
+   build. Docs, README, logs, and generated output must never be able to
+   influence generated CSS. */
+@source "../**/*.{ts,tsx,js,jsx,mdx}";
+
+:root {
+  --background: #f6faf8;
+  --foreground: #0b1f16;
+  --sp-emerald-950: #04160f;
+  --sp-emerald-900: #052e24;
+  --sp-emerald-800: #0a3324;
+  --sp-emerald-700: #0f4a34;
+  --sp-emerald-600: #047857;
+  --sp-green-500: #10b981;
+  --sp-green-400: #2ec27e;
+  --sp-mint-300: #a7f3d0;
+  --sp-mint-200: #c3f3de;
+  --sp-mint-100: #e8faf1;
+  --sp-surface: #ffffff;
+  --sp-surface-raised: #ffffff;
+  --sp-border: rgba(10, 51, 36, 0.1);
+  --sp-border-strong: rgba(10, 51, 36, 0.18);
+  --sp-muted: #5b6f66;
+
+  /* Gradients — defined here AND exposed as real .sp-* utility classes below,
+     because Tailwind v4 cannot infer that an arbitrary background utility
+     referencing a CSS variable is a background-image (it silently drops it,
+     producing invisible buttons). */
+  --sp-gradient-primary: linear-gradient(135deg, var(--sp-emerald-800) 0%, var(--sp-green-500) 55%, var(--sp-mint-300) 100%);
+  --sp-gradient-soft: linear-gradient(135deg, var(--sp-mint-100) 0%, #ffffff 60%);
+  --sp-gradient-dark: linear-gradient(160deg, var(--sp-emerald-950) 0%, var(--sp-emerald-900) 60%, var(--sp-emerald-700) 100%);
+  --sp-glow-mint: radial-gradient(circle, rgba(167, 243, 208, 0.55) 0%, rgba(167, 243, 208, 0) 70%);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #06120d;
+    --foreground: #eafaf1;
+    --sp-surface: #0c231a;
+    --sp-surface-raised: #10291f;
+    --sp-border: rgba(232, 250, 241, 0.12);
+    --sp-border-strong: rgba(232, 250, 241, 0.2);
+    --sp-muted: #9fb8ac;
+    --sp-gradient-soft: linear-gradient(135deg, rgba(167, 243, 208, 0.08) 0%, var(--sp-surface) 60%);
+  }
+}
+
+* {
+  border-color: var(--sp-border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+:focus-visible {
+  outline: 2px solid var(--sp-green-500);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ---- Brand gradient utilities (real utilities, not arbitrary values) ---- */
+.sp-gradient-primary {
+  background-image: var(--sp-gradient-primary);
+}
+.sp-gradient-soft {
+  background-image: var(--sp-gradient-soft);
+}
+.sp-gradient-dark {
+  background-image: var(--sp-gradient-dark);
+}
+.sp-gradient-text {
+  background-image: var(--sp-gradient-primary);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Primary CTA — guarantees visible white text on a real gradient background
+   in every state, light or dark. */
+.sp-btn-primary {
+  background-image: var(--sp-gradient-primary);
+  color: #ffffff;
+  box-shadow: 0 8px 24px -8px rgba(4, 46, 36, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(4, 22, 15, 0.25);
+}
+.sp-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: 0 12px 28px -8px rgba(4, 46, 36, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+}
+.sp-btn-primary:active:not(:disabled) {
+  transform: translateY(0);
+  filter: brightness(0.98);
+}
+.sp-btn-primary:disabled {
+  background-image: none;
+  background-color: var(--sp-border-strong);
+  color: var(--sp-muted);
+  box-shadow: none;
+  border-color: var(--sp-border);
+  cursor: not-allowed;
+}
+
+@keyframes sp-upload-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.12); }
+  50% { box-shadow: 0 0 0 8px rgba(16, 185, 129, 0.06); }
+}
+.sp-upload-glow {
+  animation: sp-upload-glow 2.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sp-upload-glow {
+    animation: none;
+  }
+}
+
+.sp-glow-orb {
+  background-image: var(--sp-glow-mint);
+  filter: blur(40px);
+}
+
+.sp-card-hover {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.sp-card-hover:hover,
+.sp-card-hover:focus-visible {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 32px -16px rgba(5, 46, 36, 0.25);
+}
+
+@keyframes sp-pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.sp-pulse {
+  animation: sp-pulse-dot 1.6s ease-in-out infinite;
+}
+
+@keyframes sp-dash {
+  to { stroke-dashoffset: 0; }
+}
+.sp-dash-animate {
+  animation: sp-dash 1.4s ease-out forwards;
+}
+
+@keyframes sp-check-pop {
+  0% { transform: scale(0.5); opacity: 0; }
+  70% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.sp-check-pop {
+  animation: sp-check-pop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+@keyframes sp-count-ring {
+  from { stroke-dashoffset: var(--sp-ring-start, 339); }
+  to { stroke-dashoffset: var(--sp-ring-end, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes sp-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sp-animate-in {
+  animation: sp-fade-in 0.35s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sp-animate-in {
+    animation: none;
+  }
+}
