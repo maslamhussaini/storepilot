@@ -12,32 +12,24 @@
 --   4. search_path is pinned to '' to defeat search_path-hijacking.
 --   5. Schema objects are fully qualified.
 --
--- EXECUTE grants:
---   get_connection_metadata  -> authenticated (safe: no Vault access)
---   store_connection_tokens  -> service_role only (writes Vault)
---   get_connection_tokens    -> service_role only (reads Vault)
---   revoke_connection_tokens -> service_role only (deletes Vault)
+-- EXECUTE grants (verified by supabase/tests/rls_shopify_connections_tests.sql
+-- scenario F). PostgreSQL grants EXECUTE to PUBLIC by default, and Supabase's
+-- default function privileges additionally auto-grant new public-schema
+-- functions to service_role, so every function below has the PUBLIC/anon/
+-- authenticated default explicitly REVOKED first; without that, anon and
+-- authenticated could RPC-call the token functions:
+--
+--   get_connection_metadata  -> authenticated ONLY (+ service_role via
+--                               Supabase default privileges: harmless, it is
+--                               the trusted server role)
+--   store_connection_tokens  -> service_role ONLY   (writes Vault)
+--   get_connection_tokens    -> service_role ONLY   (reads Vault)
+--   revoke_connection_tokens -> service_role ONLY   (deletes Vault)
+--
+-- There is deliberately NO browser-callable function that returns decrypted
+-- Vault material. service_role is the server-side boundary: its key exists
+-- only in server-only application code, never in the browser.
 -- ============================================================================
-
--- ---------------------------------------------------------------------------
--- Helper: derive user_id from project ownership
--- ---------------------------------------------------------------------------
-create or replace function public.sp_shopify_project_owner(
-  p_project_id uuid
-) returns uuid
-language plpgsql
-security definer
-set search_path = ''
-as $$
-begin
-  return (
-    select user_id
-    from public.sp_projects
-    where id = p_project_id
-    limit 1
-  );
-end;
-$$;
 
 -- ---------------------------------------------------------------------------
 -- store_connection_tokens
@@ -45,11 +37,19 @@ $$;
 -- Inserts or updates a Shopify connection and its Vault secret atomically.
 -- Returns the connection UUID on success.
 --
--- Token payload shape (JSONB):
---   { "access_token": "...", "refresh_token": "...", "expires_in": 3600,
---     "refresh_token_expires_in": 7776000, "scope": "" }
+-- Input token payload shape (JSONB — as returned by Shopify's
+-- /admin/oauth/access_token with expiring tokens):
+--   { "access_token": "...",          -- required, string
+--     "refresh_token": "...",         -- optional string (expiring offline flow)
+--     "expires_in": 3600,             -- optional number -> metadata column
+--     "refresh_token_expires_in": ...,-- optional number -> metadata column
+--     "scope": "" }                   -- optional string -> granted_scopes column
 --
--- Caller: server-only (service_role). Never exposed to browser.
+-- ONLY access_token and refresh_token are written to Vault (report §6).
+-- Scopes and expiries are non-secret metadata and go to table columns.
+--
+-- Caller: server-only (service_role key in server-only code). Never exposed
+-- to the browser.
 -- ---------------------------------------------------------------------------
 create or replace function public.store_connection_tokens(
   p_project_id uuid,
@@ -65,102 +65,179 @@ declare
   v_owner_user_id uuid;
   v_connection_id uuid;
   v_vault_secret_id uuid;
+  v_vault_payload jsonb;
+  v_shop_domain text;
+  v_scopes text[];
   v_access_token_expires_at timestamptz;
   v_refresh_token_expires_at timestamptz;
+  v_event_type text;
+  v_updated boolean := false;
   v_now timestamptz := now();
 begin
-  -- 1. Derive ownership from the project. Never trust client-supplied user_id.
-  v_owner_user_id := sp_shopify_project_owner(p_project_id);
-  if v_owner_user_id is null then
-    raise exception 'project % not found', p_project_id;
+  -- ------------------------------------------------------------------
+  -- 0. Input validation. Fail fast and loud; nothing is written yet.
+  -- ------------------------------------------------------------------
+  if p_token_payload is null or jsonb_typeof(p_token_payload) <> 'object' then
+    raise exception 'store_connection_tokens: p_token_payload must be a JSON object';
   end if;
 
-  -- 2. Compute expiry timestamps from token response metadata.
+  if jsonb_typeof(p_token_payload->'access_token') is distinct from 'string'
+     or coalesce(p_token_payload->>'access_token', '') = '' then
+    raise exception 'store_connection_tokens: p_token_payload.access_token must be a non-empty string';
+  end if;
+
+  if p_token_payload ? 'refresh_token'
+     and jsonb_typeof(p_token_payload->'refresh_token') is distinct from 'string' then
+    raise exception 'store_connection_tokens: p_token_payload.refresh_token must be a string when present';
+  end if;
+
+  v_shop_domain := nullif(lower(btrim(coalesce(p_shop_domain, ''))), '');
+  if v_shop_domain is null then
+    raise exception 'store_connection_tokens: p_shop_domain must be a non-empty domain';
+  end if;
+
+  -- ------------------------------------------------------------------
+  -- 1. Derive ownership from the project. Never trust client-supplied
+  --    user_id. (Runs as the definer, i.e. with server privileges.)
+  -- ------------------------------------------------------------------
+  select user_id into v_owner_user_id
+  from public.sp_projects
+  where id = p_project_id;
+
+  if v_owner_user_id is null then
+    raise exception 'store_connection_tokens: project % not found', p_project_id;
+  end if;
+
+  -- ------------------------------------------------------------------
+  -- 2. Non-secret metadata derived from the token response.
+  --    Expiry TIMESTAMPS are metadata only; token strings never leave
+  --    the vault payload built in step 4.
+  -- ------------------------------------------------------------------
   v_access_token_expires_at :=
-    case
-      when p_token_payload ? 'expires_in'
-        then v_now + ((p_token_payload->>'expires_in')::bigint || ' seconds')::interval
-      else null
-    end;
-  v_refresh_token_expires_at :=
-    case
-      when p_token_payload ? 'refresh_token_expires_in'
-        then v_now + ((p_token_payload->>'refresh_token_expires_in')::bigint || ' seconds')::interval
+    case when jsonb_typeof(p_token_payload->'expires_in') = 'number'
+      then v_now + ((p_token_payload->>'expires_in')::double precision * interval '1 second')
       else null
     end;
 
+  v_refresh_token_expires_at :=
+    case when jsonb_typeof(p_token_payload->'refresh_token_expires_in') = 'number'
+      then v_now + ((p_token_payload->>'refresh_token_expires_in')::double precision * interval '1 second')
+      else null
+    end;
+
+  -- Shopify returns scope as a comma-separated string. Zero-scope installs
+  -- (Phase 2B) return "" -> empty array.
+  select coalesce(array_remove(string_to_array(s, ','), ''), '{}')
+    into v_scopes
+  from (select coalesce(p_token_payload->>'scope', '') as s) t;
+
+  -- ------------------------------------------------------------------
   -- 3. Upsert connection metadata idempotently.
-  --    First try to UPDATE an existing active connection for this project.
+  --    First try to UPDATE the project's active connection; else INSERT.
+  --    Both paths trigger-verify user_id against the project owner.
+  -- ------------------------------------------------------------------
   update public.sp_shopify_connections
-     set shop_domain = p_shop_domain,
+     set shop_domain = v_shop_domain,
+         granted_scopes = v_scopes,
          access_token_expires_at = v_access_token_expires_at,
          refresh_token_expires_at = v_refresh_token_expires_at,
+         disconnected_at = null,
+         last_verified_at = v_now,
          updated_at = v_now
    where project_id = p_project_id
      and status = 'connected'
   returning id, vault_secret_id into v_connection_id, v_vault_secret_id;
 
-  -- If no active connection existed, INSERT a new one.
+  if v_connection_id is not null then
+    v_updated := true;
+  end if;
+
   if v_connection_id is null then
     insert into public.sp_shopify_connections (
-      project_id, user_id, shop_domain, status,
-      vault_secret_id, access_token_expires_at, refresh_token_expires_at, installed_at
+      project_id, user_id, shop_domain, status, granted_scopes,
+      vault_secret_id, access_token_expires_at, refresh_token_expires_at,
+      installed_at, last_verified_at
     ) values (
-      p_project_id, v_owner_user_id, p_shop_domain, 'connected',
-      null, v_access_token_expires_at, v_refresh_token_expires_at, v_now
+      p_project_id, v_owner_user_id, v_shop_domain, 'connected', v_scopes,
+      null, v_access_token_expires_at, v_refresh_token_expires_at, v_now, v_now
     )
     returning id into v_connection_id;
   end if;
 
-  -- 4. Store or update token material in Vault (encrypted at rest).
-  --    If the connection already has a Vault secret, update it in-place so we
-  --    don't leak orphaned secrets. Otherwise create a new one.
+  -- ------------------------------------------------------------------
+  -- 4. Store token material in Vault — WHITELISTED to the two token
+  --    fields only, so nothing else from the raw OAuth response can ride
+  --    along into the secret. If this connection already has a Vault
+  --    secret, update it in place (no orphaned secrets on re-auth).
+  -- ------------------------------------------------------------------
+  v_vault_payload := jsonb_strip_nulls(jsonb_build_object(
+    'access_token', p_token_payload->'access_token',
+    'refresh_token', p_token_payload->'refresh_token'
+  ));
+
   if v_vault_secret_id is not null then
     perform vault.update_secret(
       v_vault_secret_id,
-      new_secret => p_token_payload::text
+      new_secret => v_vault_payload::text
     );
   else
+    -- Argument order: (new_secret, new_name, new_description, new_key_id)
     select vault.create_secret(
+      v_vault_payload::text,
       'shopify-tokens-' || v_connection_id,
-      p_token_payload::text,
       'Shopify OAuth tokens for connection ' || v_connection_id
     ) into v_vault_secret_id;
   end if;
 
-  -- 5. Update the connection row with the Vault secret reference.
+  -- ------------------------------------------------------------------
+  -- 5. Record the Vault secret reference on the connection row.
+  -- ------------------------------------------------------------------
   update public.sp_shopify_connections
      set vault_secret_id = v_vault_secret_id,
          updated_at = v_now
    where id = v_connection_id;
 
-  -- 6. Log the lifecycle event.
+  -- ------------------------------------------------------------------
+  -- 6. Log the lifecycle event (non-secret metadata only).
+  -- ------------------------------------------------------------------
+  if v_updated then
+    v_event_type := 'reconnected';  -- re-auth on the project's active row
+  elsif exists (
+    select 1 from public.sp_shopify_connections
+    where project_id = p_project_id
+      and id <> v_connection_id      -- any row other than the one just added
+  ) then
+    v_event_type := 'reconnected';  -- project has connection history
+  else
+    v_event_type := 'installed';    -- first-ever connection for this project
+  end if;
+
   insert into public.sp_shopify_connection_events (
     connection_id, project_id, event_type, metadata
   ) values (
     v_connection_id,
     p_project_id,
-    'installed',
-    jsonb_build_object('shop_domain', p_shop_domain)
+    v_event_type,
+    jsonb_build_object('shop_domain', v_shop_domain)
   );
 
   return v_connection_id;
-exception
-  when others then
-    -- If anything fails, the transaction rolls back and no partial state
-    -- remains. The caller sees the original error.
-    raise;
+  -- Any exception above propagates to the caller and rolls back the whole
+  -- transaction (steps 1-6 are one implicit transaction), which is what makes
+  -- "status=connected but no Vault secret" impossible. See report §9.
 end;
 $$;
 
 comment on function public.store_connection_tokens is
-  'Server-only. Atomically stores Shopify tokens in Vault and upserts connection metadata. Never returns token material. Caller must hold service_role.';
+  'Server-only (service_role). Atomically stores access_token+refresh_token in Vault and upserts connection metadata. Never returns token material. EXECUTE revoked from PUBLIC/anon/authenticated.';
 
 -- ---------------------------------------------------------------------------
 -- get_connection_metadata
 --
--- Returns safe, non-secret connection metadata for the wizard UI.
--- Caller: authenticated role (RLS further restricts to owned projects).
+-- Returns safe, non-secret connection metadata for the wizard UI: the most
+-- relevant row for the project (active connection first, else latest
+-- history). Never touches Vault, never returns token material.
+-- Caller: authenticated role (ownership enforced inside the function).
 -- ---------------------------------------------------------------------------
 create or replace function public.get_connection_metadata(
   p_project_id uuid
@@ -192,27 +269,36 @@ begin
       select 1 from public.sp_projects p
       where p.id = p_project_id
         and p.user_id = (select auth.uid())
-    );
+    )
+  order by (sc.status = 'connected') desc, sc.updated_at desc
+  limit 1;
 end;
 $$;
 
 comment on function public.get_connection_metadata is
-  'Safe metadata only: shop domain, status, scopes, timestamps. No token material. Callable by authenticated users for their own projects.';
+  'Safe metadata only: shop domain, status, scopes, timestamps. No token material, no Vault reference. Callable by authenticated users for their own projects.';
 
 -- ---------------------------------------------------------------------------
 -- get_connection_tokens
 --
 -- Returns decrypted token material from Vault for a project's active
--- connection. Caller: service_role only. Never exposed to browser.
+-- connection, together with the non-secret expiry metadata needed by the
+-- future refresh logic (Phase 2B.3B).
+--
+-- Caller: service_role ONLY (server-side). The ownership EXISTS-check used
+-- in an earlier draft was removed deliberately: auth.uid() is NULL in the
+-- trusted server context, which would have made the function return nothing
+-- for its only legitimate caller. The EXECUTE grant is the boundary here.
 -- ---------------------------------------------------------------------------
 create or replace function public.get_connection_tokens(
   p_project_id uuid
 )
 returns table (
+  shop_domain text,
   access_token text,
   refresh_token text,
-  expires_in integer,
-  scope text
+  access_token_expires_at timestamptz,
+  refresh_token_expires_at timestamptz
 )
 language plpgsql
 security definer
@@ -221,30 +307,32 @@ as $$
 begin
   return query
   select
-    (vs.decrypted_secret->>'access_token')::text,
-    (vs.decrypted_secret->>'refresh_token')::text,
-    (vs.decrypted_secret->>'expires_in')::integer,
-    (vs.decrypted_secret->>'scope')::text
+    sc.shop_domain,
+    (vs.decrypted_secret::jsonb ->> 'access_token')::text,
+    (vs.decrypted_secret::jsonb ->> 'refresh_token')::text,
+    sc.access_token_expires_at,
+    sc.refresh_token_expires_at
   from public.sp_shopify_connections sc
   join vault.decrypted_secrets vs on vs.id = sc.vault_secret_id
   where sc.project_id = p_project_id
-    and sc.status = 'connected'
-    and exists (
-      select 1 from public.sp_projects p
-      where p.id = p_project_id
-        and p.user_id = (select auth.uid())
-    );
+    and sc.status = 'connected';
 end;
 $$;
 
 comment on function public.get_connection_tokens is
-  'Returns decrypted Shopify tokens from Vault. Server-only: callable only via service_role. Never returned to browser.';
+  'Returns decrypted Shopify tokens from Vault. Server-only: EXECUTE granted to service_role exclusively. Never callable by anon/authenticated, never returned to browser. Note: vault.decrypted_secrets.decrypted_secret is text in supabase_vault 0.3.1, hence the ::jsonb cast.';
 
 -- ---------------------------------------------------------------------------
 -- revoke_connection_tokens
 --
 -- Deletes the Vault secret and marks the connection disconnected/uninstalled.
 -- Caller: service_role only.
+--
+-- Ordering rationale: the Vault secret is deleted first. Because both steps
+-- are one transaction this is not strictly required for consistency, but it
+-- keeps the "worst case if a future change ever splits the transaction"
+-- failure mode as: tokens gone, row still marked connected (recoverable) —
+-- rather than row disconnected while tokens remain in Vault (silent leak).
 -- ---------------------------------------------------------------------------
 create or replace function public.revoke_connection_tokens(
   p_project_id uuid,
@@ -258,54 +346,74 @@ as $$
 declare
   v_connection_id uuid;
   v_vault_secret_id uuid;
+  v_event_type text;
 begin
-  -- Find the active connection and its Vault reference.
+  -- Find the most relevant non-terminal connection for this project.
   select id, vault_secret_id
     into v_connection_id, v_vault_secret_id
   from public.sp_shopify_connections
   where project_id = p_project_id
-    and status = 'connected';
+    and status in ('connected', 'reauth_required')
+  order by (status = 'connected') desc, updated_at desc
+  limit 1;
 
   if v_connection_id is null then
     return; -- nothing to revoke
   end if;
 
-  -- 1. Delete the Vault secret FIRST. If this fails, the connection stays
-  --    active — safer than marking it disconnected while tokens remain.
+  -- 1. Delete the Vault secret FIRST (see ordering rationale above).
   if v_vault_secret_id is not null then
     delete from vault.secrets where id = v_vault_secret_id;
   end if;
 
-  -- 2. Mark the connection as disconnected/uninstalled.
+  -- 2. Mark the connection disconnected/uninstalled and drop the reference.
+  v_event_type := case when p_reason = 'uninstalled' then 'uninstalled' else 'disconnected' end;
+
   update public.sp_shopify_connections
-     set status = case when p_reason = 'uninstalled' then 'uninstalled' else 'disconnected' end,
+     set status = v_event_type,
          disconnected_at = now(),
          vault_secret_id = null,
          updated_at = now()
    where id = v_connection_id;
 
-  -- 3. Log the event.
+  -- 3. Log the event (metadata: reason only — no tokens, no state).
   insert into public.sp_shopify_connection_events (
     connection_id, project_id, event_type, metadata
   ) values (
     v_connection_id,
     p_project_id,
-    case when p_reason = 'uninstalled' then 'uninstalled' else 'disconnected' end,
+    v_event_type,
     jsonb_build_object('reason', p_reason)
   );
 end;
 $$;
 
 comment on function public.revoke_connection_tokens is
-  'Deletes Vault secret and marks connection disconnected/uninstalled. Server-only: callable only via service_role.';
+  'Deletes Vault secret and marks connection disconnected/uninstalled. Server-only: EXECUTE granted to service_role exclusively.';
 
 -- ---------------------------------------------------------------------------
--- GRANTS
+-- GRANTS — the load-bearing part
 -- ---------------------------------------------------------------------------
--- Safe metadata function: can be called by authenticated users for their
--- own projects (RLS on the underlying table provides the second layer).
+-- 1. PostgreSQL grants EXECUTE to PUBLIC by default. Revoke that everywhere
+--    first, otherwise anon/authenticated could RPC-call the token functions.
+revoke execute on function public.store_connection_tokens(uuid, text, jsonb)
+  from public, anon, authenticated;
+revoke execute on function public.get_connection_metadata(uuid)
+  from public, anon, authenticated;
+revoke execute on function public.get_connection_tokens(uuid)
+  from public, anon, authenticated;
+revoke execute on function public.revoke_connection_tokens(uuid, text)
+  from public, anon, authenticated;
+
+-- 2. Explicit allow-list:
+--    * safe metadata  -> the signed-in user (wizard UI / PostgREST RPC)
+--    * token functions -> service_role only (server-side boundary; the key
+--      lives in server-only application code and never reaches the browser)
 grant execute on function public.get_connection_metadata(uuid) to authenticated;
-
--- Token-reading and mutation functions: service_role only.
--- We do NOT grant these to authenticated or anon.
--- The Next.js server-only code must use the service_role Supabase client.
+-- service_role's EXECUTE on get_connection_metadata arrives via Supabase's
+-- default function privileges; stated explicitly here so the intent is on the
+-- record (trusted server role, safe metadata only).
+grant execute on function public.get_connection_metadata(uuid) to service_role;
+grant execute on function public.store_connection_tokens(uuid, text, jsonb) to service_role;
+grant execute on function public.get_connection_tokens(uuid) to service_role;
+grant execute on function public.revoke_connection_tokens(uuid, text) to service_role;

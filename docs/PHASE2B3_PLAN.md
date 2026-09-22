@@ -39,6 +39,43 @@ persistence layer.
    implicit PL/pgSQL transaction. No explicit COMMIT needed.
 6. **Grants**: `get_connection_metadata` → `authenticated`; all token functions
    → `service_role` only.
+7. **No subqueries in CHECK**: PostgreSQL rejects
+   `CHECK (exists (select ...))` with "cannot use subquery in check
+   constraint" (verified on PostgreSQL 17). The ownership invariant is
+   enforced by a BEFORE INSERT/UPDATE trigger
+   (`sp_shopify_connections_enforce_ownership`) instead, which also fails
+   closed for non-RLS-bypassing writers.
+8. **Vault decoding**: `vault.decrypted_secrets.decrypted_secret` is `text`
+   (supabase_vault 0.3.1), not `jsonb` — the getter must cast `::jsonb`
+   before using `->>`.
+9. **EXECUTE grants are load-bearing**: PostgreSQL grants EXECUTE to PUBLIC by
+   default and Supabase's default function privileges auto-grant new
+   public-schema functions to `service_role`. Every function therefore
+   explicitly REVOKEs PUBLIC/anon/authenticated first, then grants only the
+   intended roles. Test scenario F proves the resulting matrix.
+10. **No `auth.uid()` check in token functions**: `auth.uid()` is NULL in the
+    trusted `service_role` context, so an ownership check there would return
+    nothing for the only legitimate caller. The boundary is the EXECUTE
+    grant. `get_connection_metadata` (the authenticated path) keeps the uid
+    ownership check.
+11. **Vault payload whitelist**: only `access_token` + `refresh_token` are
+    written to Vault. `expires_in` / `refresh_token_expires_in` become
+    `timestamptz` columns on the connection row; `scope` becomes
+    `granted_scopes`.
+12. **Secret-less events are DB-enforced**: a CHECK constraint on
+    `sp_shopify_connection_events.metadata` rejects secret-bearing keys
+    (access_token, refresh_token, authorization code, client_secret, OAuth
+    state, cookies, ...) at any nesting depth, on every write path including
+    `service_role`.
+13. **`vault.create_secret` argument order**: `(new_secret, new_name,
+    new_description, new_key_id)` — swapping secret and name is a silent
+    failure that only the decrypt round-trip test (G.3) catches.
+14. **Event type & normalization**: re-authentication logs `reconnected`
+    (never `installed`); `store_connection_tokens` lowercases and trims
+    `p_shop_domain` before persisting.
+15. **Cloud execution path**: migrations are fully verified locally and were
+    subsequently applied to and verified on cloud project
+    `nchxfngytvchlnlogeuy` (see report §Q).
 
 ---
 
