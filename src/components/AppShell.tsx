@@ -10,20 +10,24 @@ import { userInitials } from "@/lib/auth/dal";
 /**
  * Application shell.
  *
- * Phase 2A changes are functional only — the markup, spacing and classes are
- * unchanged from Phase 1. What changed:
+ * The shared header keeps its existing layout and responsive classes. What it
+ * provides:
  *   * the account chip shows the real signed-in email instead of a hardcoded one
  *   * "+ New Store" is a form that creates a real project row, not a link to a
  *     global demo wizard (there is no longer a project-less wizard route)
- *   * a sign-out control was added next to the account chip
+ *   * route pages can opt out of the global action when it is out of context
+ *   * a sign-out control sits next to the account chip
  */
 export function AppShell({
   children,
   user,
+  showNewStore = true,
 }: {
   children: ReactNode;
   // Matches Supabase's `User.email`, which is optional.
   user?: { email?: string | null } | null;
+  /** Route pages can hide the global creation action when it is out of context. */
+  showNewStore?: boolean;
 }) {
   return (
     <div className="flex min-h-screen flex-col">
@@ -49,19 +53,19 @@ export function AppShell({
           </nav>
 
           <div className="flex items-center gap-3">
-            {/*
-              A form, not a link: creating a store is a mutation. The submit
-              button disables itself while pending so a double-click cannot
-              create two drafts.
-            */}
-            <form action={createProjectAction} className="hidden sm:block">
-              <SubmitButton
-                className="px-4 py-2"
-                pendingLabel="Creating…"
-              >
-                + New Store
-              </SubmitButton>
-            </form>
+            {/* A form, not a link: creating a store is a mutation. The submit
+                button disables itself while pending so a double-click cannot
+                create two drafts. */}
+            {showNewStore ? (
+              <form action={createProjectAction} className="hidden sm:block">
+                <SubmitButton
+                  className="px-4 py-2"
+                  pendingLabel="Creating…"
+                >
+                  + New Store
+                </SubmitButton>
+              </form>
+            ) : null}
 
             {user ? (
               <div className="flex items-center gap-2">

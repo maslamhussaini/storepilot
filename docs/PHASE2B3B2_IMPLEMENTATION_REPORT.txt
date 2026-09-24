@@ -1,0 +1,139 @@
+StorePilot — Phase 2B.3B-2
+Shopify Token Lifecycle & Refresh Foundation — Implementation Summary
+=====================================================================
+Date: 2026-09-24
+Status: COMPLETE / VERIFIED
+
+Scope
+-----
+Implemented the server-only Shopify token refresh foundation without changing
+Shopify scopes/configuration, OAuth callback behavior, wizard behavior,
+deployment configuration, or the existing production token.
+
+Refresh policy
+--------------
+Shopify currently reports expiring offline access tokens with expires_in
+normally around 3,600 seconds. StorePilot derives the actual expiry from
+Shopify's expires_in response. Shopify recommends refreshing shortly before
+expiry (often a few minutes ahead). StorePilot uses a 60-second proactive
+safety window before the recorded access-token expiry. That threshold is
+StorePilot's implementation policy, not a Shopify-mandated constant. A literal
+one-hour threshold would make every newly issued token immediately
+refresh-eligible. Explicit forced refresh remains available.
+
+Implemented architecture
+------------------------
+- `src/lib/shopify/token-lifecycle.ts`
+  - Server-only lifecycle state machine
+  - Fresh-token reuse and forced refresh
+  - Strict refresh-response validation
+  - 60-second refresh threshold
+  - Claim release and reauth transitions
+  - Stale-completion handling
+
+- `src/lib/shopify/tokens.ts`
+  - `getValidAccessToken(connectionId, options?)`
+  - `forceRefreshAccessToken(connectionId)`
+  - Server-only service-role adapter
+  - Form-encoded Shopify refresh request with bounded timeout
+  - No browser/API JSON token exposure
+
+- `supabase/migrations/20260924000000_add_shopify_token_refresh_lifecycle.sql`
+  - Added `credential_version`
+  - Added `refresh_claim_id`
+  - Added `refresh_claim_expires_at`
+  - Added service-role-only claim/complete/release/reauth RPCs
+  - OAuth persistence now invalidates stale refresh claims
+  - Vault rotation, metadata, generation, and event writes are atomic
+
+- `src/lib/supabase/types.ts`
+  - Added lifecycle RPC signatures and corrected nullable refresh-token typing
+
+- `package.json` / `tsconfig.json`
+  - Added deterministic Node token-lifecycle test command
+  - Enabled TypeScript-extension imports for the Node test harness
+
+Concurrency and atomicity
+------------------------
+- A database lease prevents simultaneous refresh completion.
+- Credential-generation checks reject stale OAuth/refresh writes.
+- OAuth reauthorization clears refresh claims and increments the generation.
+- Transient failures release the claim without changing connection status.
+- HTTP 401 transitions to `reauth_required`, deletes invalid Vault material,
+  preserves history, and emits one idempotent event.
+- Malformed responses and non-401 permanent failures never partially persist.
+- No second token-storage mechanism was introduced.
+
+Files added
+-----------
+- `src/lib/shopify/token-lifecycle.ts`
+- `scripts/shopify-token-lifecycle-tests.mts`
+- `supabase/migrations/20260924000000_add_shopify_token_refresh_lifecycle.sql`
+- `supabase/tests/shopify_token_refresh_tests.sql`
+
+Files extended
+-------------
+- `src/lib/shopify/tokens.ts`
+- `src/lib/supabase/types.ts`
+- `scripts/shopify-connectivity-tests.mjs`
+- `package.json`
+- `tsconfig.json`
+
+No OAuth callback, authorization route, scope, environment, Vercel, Shopify
+configuration, or wizard UI files were changed by this phase.
+
+Verification
+------------
+Application tests:
+- `npm run test:shopify:tokens` — 14/14 PASS
+- `npm run test:shopify` — 99 assertions PASS
+
+Local Supabase:
+- `supabase db reset` — PASS
+- Phase 2A RLS suite — 25/25 PASS
+- Existing Shopify persistence/RLS suite — 57/57 PASS
+- New token refresh SQL suite — 25/25 PASS
+- `supabase db lint --local --fail-on error` — PASS
+- Local fake-test residue — 0 users, 0 connections, 0 Shopify Vault secrets
+
+Cloud verification:
+- Migration applied as `add_shopify_token_refresh_lifecycle`
+- Structural columns/functions/grants verified
+- Transactional lifecycle checks — 13/13 PASS
+- Existing-path cloud smoke checks — 3/3 PASS
+- Cloud fake-test residue — 0 users, 0 projects, 0 connections, 0 Vault secrets
+
+Quality gates:
+- `npm run check:css` — PASS, 69 files scanned
+- `npm run lint` — PASS
+- `npx tsc --noEmit` — PASS
+- `npm run build` — PASS
+- Build was not run concurrently with `next dev`
+
+Security scans:
+- Real token-prefix scan — 0 matches
+- Client static bundle lifecycle/token scan — 0 matches
+- Ordinary public tables/events token-material scan — 0 matches
+- No production Vault secret was decrypted or printed
+
+Production impact
+-----------------
+- No real Shopify refresh was performed.
+- Royal Oud remains the only active production connection.
+- Its Vault reference remains present.
+- Credential generation is 1.
+- Refresh claim count is 0.
+- `token_refreshed` event count is 0.
+- `reauth_required` event count is 0.
+- The production access-token expiry was already elapsed; a future real
+  refresh requires explicit manual approval.
+
+Remaining work
+--------------
+- Connect the trusted getter to a future Admin API caller.
+- Add the optional one-retry-after-401 helper when an Admin API operation exists.
+- Perform a real production refresh only with manual approval.
+- Catalog/import, disconnect, and uninstall remain deferred.
+
+Finalization commit and push details will be recorded in the final response.
+No deployment or Phase 2B.3B-2 follow-on work was started.

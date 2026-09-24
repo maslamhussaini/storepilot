@@ -1,0 +1,136 @@
+StorePilot — Phase 2B.3B-2
+Shopify Token Lifecycle & Refresh Foundation — Status Summary
+==============================================================
+Date: 2026-09-24
+Status: COMPLETE / VERIFIED
+
+Important
+---------
+Phase 2B.3B-2 has been implemented and verified. No real production token
+refresh was performed. The production connection remains untouched by refresh
+rotation.
+
+Completed prior phases
+----------------------
+Phase 2B.3B-1 — Shopify OAuth persistence
+- Production OAuth and persistence acceptance passed and is frozen.
+- Existing active connection: 0tsfz1-eg.myshopify.com
+- Token material is stored only in Supabase Vault.
+- Ordinary application tables contain no token material.
+- One `installed` lifecycle event exists.
+- OAuth callback persistence works.
+- RLS / FORCE RLS / SECURITY DEFINER boundaries passed local and cloud tests.
+- Wizard safe connection metadata reads work.
+
+Phase 2B.3B-1.1 — Wizard global action UX cleanup
+- Completed and verified.
+- `+ New Store` is hidden on all `/projects/[projectId]/wizard/*` step routes.
+- `+ New Store` remains visible on Dashboard.
+- Existing shared header and responsive behavior are preserved.
+
+Current architecture relevant to Phase 2B.3B-2
+-------------------------------------------------
+- `src/lib/shopify/tokens.ts` is a server-only service-role boundary for OAuth
+  persistence and trusted token lifecycle operations.
+- `src/lib/shopify/token-lifecycle.ts` implements the deterministic refresh
+  state machine and policy.
+- `public.get_connection_tokens_by_id` and the claim/complete/release/reauth
+  RPCs are service-role-only trusted DB/Vault boundaries.
+- `sp_shopify_connections` contains the existing expiry metadata plus the new
+  credential generation and refresh lease fields.
+- `sp_shopify_connection_events` supports `token_refreshed` and
+  `reauth_required` with non-secret metadata.
+- OAuth persistence invalidates stale refresh claims, while successful refresh
+  rotates the existing Vault secret atomically.
+- No product/catalog API calls are part of this phase.
+
+Approved/implemented Phase 2B.3B-2 scope
+----------------------------------------
+1. Audit the current OAuth, Vault, schema, service-role, API-version, and
+   expiry-metadata architecture before implementation.
+2. Add a narrow server-only `getValidAccessToken(connectionId)` abstraction.
+3. Reuse a sufficiently fresh access token without refreshing.
+4. Shopify currently reports expiring offline access tokens with expires_in
+   normally around 3,600 seconds. StorePilot derives actual expiry from
+   Shopify's expires_in response. Shopify recommends refreshing shortly before
+   expiry (often a few minutes ahead). StorePilot uses a 60-second proactive
+   safety window before the recorded access-token expiry. That threshold is
+   StorePilot's implementation policy, not a Shopify-mandated constant.
+5. Use Shopify's documented refresh-token flow without changing scopes or
+   Shopify/Partner configuration.
+6. Validate the complete refresh response before persistence.
+7. Rotate access and refresh tokens in Vault atomically with metadata updates.
+8. Insert exactly one `token_refreshed` event on successful rotation.
+9. Keep transient network/5xx failures from incorrectly setting
+   `reauth_required`.
+10. Mark `reauth_required` and emit exactly one transition event only when
+    Shopify clearly invalidates the refresh credential.
+11. Prevent duplicate lifecycle events and concurrent refresh corruption.
+12. Consider a server-only one-retry-after-401 helper; do not implement catalog
+    or product fetching in this phase.
+13. Add regression coverage for security, tenant isolation, response shape,
+    refresh, rotation, failure, concurrency, and atomicity behavior.
+
+Required security invariants
+----------------------------
+- No token material in client components.
+- No token material in API JSON responses.
+- No token material in ordinary public tables.
+- No token material in lifecycle event metadata.
+- No token material in logs.
+- Authenticated and anonymous roles cannot retrieve Vault secrets.
+- Cross-tenant access remains impossible.
+- Service-role usage remains server-only.
+- Existing SECURITY DEFINER EXECUTE grants remain explicit.
+- `search_path` remains hardened.
+- Token operations fail closed.
+
+Required test coverage
+----------------------
+A. Valid unexpired token: no refresh.
+B. Token within refresh threshold: one refresh.
+C. Expired access token: refresh.
+D. Successful refresh: Vault rotation, updated expiry metadata, one
+   `token_refreshed` event.
+E. Rotated refresh token becomes authoritative.
+F. Malformed refresh response: no partial persistence.
+G. Network/5xx failure: do not incorrectly mark reauth required.
+H. Invalid/revoked refresh credential: mark `reauth_required` and emit one
+   event.
+I. Repeated reauth failure: no event spam.
+J. Concurrent refresh attempts: no corruption or stale overwrite.
+K. Tenant isolation.
+L. Authenticated/anon roles cannot retrieve raw tokens.
+M. Rollback and Vault/metadata atomicity.
+N. Secret scans across ordinary tables, events, RPC output, logs, and client
+   code.
+O. Existing Phase 2A and Phase 2B persistence/RLS tests remain green.
+
+Production safety constraints
+------------------------------
+- Do not force-refresh the real production connection merely to demonstrate
+  the implementation.
+- Use deterministic tests, fake fixtures, local Supabase tests, and cloud
+  transactional tests that roll back.
+- If a real Shopify refresh becomes necessary, stop and request manual
+  approval first.
+- Never print or decrypt the existing production token.
+
+Out of scope
+------------
+- Catalog import or product fetching.
+- Shopify scopes or Partner configuration changes.
+- Disconnect flow.
+- Uninstall webhook.
+- Wizard redesign.
+- OAuth/persistence changes unrelated to refresh.
+- Real production token refresh.
+- Deployment.
+
+Current conclusion
+------------------
+Phase 2B.3B-2 is implemented and verified. The server-only refresh lifecycle,
+Vault rotation guards, lifecycle events, regression tests, local Supabase
+verification, and transactional cloud verification are complete. The existing
+production connection remains unchanged by refresh lifecycle activity, and no
+real Shopify token refresh was performed.

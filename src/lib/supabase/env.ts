@@ -3,11 +3,14 @@
  *
  * SECURITY: this module is imported by BOTH server and client code, so it may
  * only ever touch `NEXT_PUBLIC_*` variables. The service-role key
- * (`SUPABASE_SERVICE_ROLE_KEY`) is deliberately not referenced anywhere in
- * `src/` — Phase 2A performs every database operation through the calling
- * user's own session so that Row Level Security stays in force. If that key
- * were read here it would be inlined into the browser bundle by the Next.js
- * bundler and would hand every visitor RLS-bypassing access.
+ * (`SUPABASE_SERVICE_ROLE_KEY`) is deliberately never referenced HERE — every
+ * database operation made through clients built from this module runs under
+ * the calling user's own session so that Row Level Security stays in force.
+ * If that key were read here it would be inlined into the browser bundle by
+ * the Next.js bundler and would hand every visitor RLS-bypassing access.
+ * Since Phase 2B.3B-1 the service-role key IS read in exactly one place:
+ * `src/lib/shopify/tokens.ts`, a `server-only` module — never in this shared
+ * module, never from a `NEXT_PUBLIC_*` variable.
  *
  * KEY NAME: `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` is Supabase's current
  * browser-safe key name (their newer `sb_publishable_…` key format). Earlier

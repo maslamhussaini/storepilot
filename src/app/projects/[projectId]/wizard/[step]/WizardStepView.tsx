@@ -39,6 +39,7 @@ import {
   readinessBuckets,
 } from "@/data/wizard";
 import { normalizeShopDomain } from "@/lib/shopify/shop";
+import type { ShopifyConnectionStatus } from "@/lib/shopify/status";
 
 /**
  * Wizard step bodies.
@@ -70,17 +71,15 @@ export interface BusinessProfileView {
   secondaryLanguage: string | null;
 }
 
-export type ShopifySpikeResult =
-  | { status: "ok"; shop: string }
-  | { status: "error"; reason: string }
-  | null;
-
 interface StepProps {
   step: WizardStepKey;
   projectId: string;
   projectName: string;
   profile: BusinessProfileView | null;
-  shopifyResult?: ShopifySpikeResult;
+  /** Durable connection state from sp_shopify_connections (safe DTO). */
+  connection: ShopifyConnectionStatus;
+  /** Generic, non-sensitive OAuth failure reason code from the callback, if any. */
+  oauthError?: string | null;
 }
 
 export function WizardStepView({
@@ -88,11 +87,12 @@ export function WizardStepView({
   projectId,
   projectName,
   profile,
-  shopifyResult = null,
+  connection,
+  oauthError = null,
 }: StepProps) {
   switch (step) {
     case "connect":
-      return <ConnectStep projectId={projectId} result={shopifyResult} />;
+      return <ConnectStep projectId={projectId} connection={connection} oauthError={oauthError} />;
     case "business":
       return <BusinessStep projectId={projectId} profile={profile} />;
     case "catalog":
@@ -173,35 +173,40 @@ function StepNav({
 }
 
 // ---------------------------------------------------------------------------
-// 1. Connect — REAL OAuth connectivity spike (Phase 2B.2b)
+// 1. Connect — REAL Shopify OAuth + DURABLE connection (Phase 2B.3B-1)
 //
 // This posts straight to POST /api/shopify/authorize as a native HTML form
 // (not a client fetch): the browser must literally follow the 302 redirect
 // to Shopify's authorize page, which fetch() cannot do — it would just
 // receive Shopify's HTML as a JS value instead of navigating there. This is
 // also what keeps authorization server-initiated: the client never sees a
-// client_id, a state value, or (later) a token — it only ever submits a shop
-// domain and gets redirected.
+// client_id, a state value, or a token — it only ever submits a shop domain
+// and gets redirected.
 //
-// Deliberately NOT marked complete/connected here in any durable way: this
-// spike does not persist a connection (see docs/PHASE2B2_PREFLIGHT_REPORT.md
-// §4 for the real Vault-backed design, not implemented yet). "Continue" only
-// unlocks within the same page load where the callback just reported success
-// via the query string — a refresh loses that, which is correct for now.
+// DURABLE STATE: after the callback persists the connection (Vault +
+// sp_shopify_connections, server-side), the connected view below is driven
+// exclusively by the `connection` prop, which the Server Component reads from
+// Supabase on EVERY render. Refresh, new tab, sign-out/sign-in all re-read
+// the same row — never a query parameter, never sessionStorage. The
+// `oauthError` prop only ever renders a failure banner; no query parameter
+// can present a store as connected.
 // ---------------------------------------------------------------------------
 
 function ConnectStep({
   projectId,
-  result,
+  connection,
+  oauthError,
 }: {
   projectId: string;
-  result: ShopifySpikeResult;
+  connection: ShopifyConnectionStatus;
+  oauthError: string | null;
 }) {
   const [shopInput, setShopInput] = useState("");
   const normalized = shopInput.trim() ? normalizeShopDomain(shopInput) : null;
   const shopLooksInvalid = shopInput.trim().length > 0 && normalized === null;
 
-  const connected = result?.status === "ok";
+  // Single source of truth: durable DB metadata, nothing else.
+  const connected = connection.connected;
 
   return (
     <div>
@@ -260,8 +265,8 @@ function ConnectStep({
 
         {connected ? (
           <>
-            <StatusBadge label="✓ Shopify authorization successful" tone="success" />
-            <p className="text-sm text-[var(--sp-muted)]">{result.shop}</p>
+            <StatusBadge label="✓ Shopify connected" tone="success" />
+            <p className="text-sm text-[var(--sp-muted)]">{connection.shopDomain}</p>
           </>
         ) : (
           <form
@@ -288,20 +293,23 @@ function ConnectStep({
         )}
       </div>
 
-      {result?.status === "error" ? (
+      {oauthError ? (
         <div className="mt-4">
           <FormAlert tone="error">
-            Shopify authorization couldn&apos;t be completed ({result.reason}). Please try
+            Shopify authorization couldn&apos;t be completed ({oauthError}). Please try
             again.
           </FormAlert>
         </div>
       ) : null}
 
-      <DemoNotice>
-        This is a Phase 2B connectivity spike: authorization runs for real against Shopify,
-        but nothing is saved to your account yet — no token is stored, and this connection
-        will need to be redone once persistence ships.
-      </DemoNotice>
+      <div className="mt-4 rounded-xl border border-[var(--sp-border)] p-4">
+        <p className="text-xs text-[var(--sp-muted)]">
+          <span className="font-semibold">Secure connection.</span> Authorization runs for
+          real against Shopify. Your connection is saved to your StorePilot account
+          (tokens encrypted, never shown here) and stays connected across refreshes and
+          sign-in. Catalog import and store build remain simulated in this preview.
+        </p>
+      </div>
 
       <StepNav projectId={projectId} step="connect" nextDisabled={!connected} />
     </div>

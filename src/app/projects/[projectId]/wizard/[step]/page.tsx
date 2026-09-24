@@ -6,8 +6,10 @@ import { GradientButton } from "@/components/GradientButton";
 import { FormAlert } from "@/components/FormField";
 import { WizardStepView } from "@/app/projects/[projectId]/wizard/[step]/WizardStepView";
 import { requireUser } from "@/lib/auth/dal";
+import { getConnectionStatus } from "@/lib/shopify/connections";
 import { getProjectWithProfile } from "@/lib/projects/queries";
 import { getStep, isWizardStep } from "@/lib/wizard/steps";
+import { NO_CONNECTION } from "@/lib/shopify/status";
 
 export const metadata: Metadata = {
   title: "Store setup — StorePilot",
@@ -39,20 +41,16 @@ export default async function ProjectWizardStepPage({
   searchParams,
 }: {
   params: Promise<{ projectId: string; step: string }>;
-  searchParams: Promise<{ shopify_spike?: string; shopify_error?: string; shop?: string }>;
+  searchParams: Promise<{ shopify_oauth?: string; shopify_error?: string }>;
 }) {
   const [{ projectId, step }, user, sp] = await Promise.all([params, requireUser(), searchParams]);
 
-  // Phase 2B.2b connectivity-spike result, surfaced to the Connect step only.
-  // Non-sensitive by construction: the callback route only ever puts a
-  // success flag + shop domain, or a generic error reason, into this query —
-  // never a token value.
-  const shopifyResult: { status: "ok"; shop: string } | { status: "error"; reason: string } | null =
-    sp.shopify_spike === "ok"
-      ? { status: "ok", shop: sp.shop ?? "" }
-      : sp.shopify_error
-        ? { status: "error", reason: sp.shopify_error }
-        : null;
+  // Phase 2B.3B-1: `shopify_oauth` is a NON-SENSITIVE flag meaning only "an
+  // OAuth attempt came back". It is deliberately NOT a success signal for the
+  // UI — connected status is read from durable Supabase metadata below, so a
+  // hand-crafted query string can never fake a connection. `shopify_error`
+  // carries a generic, non-sensitive reason code from the callback.
+  const oauthError: string | null = sp.shopify_error ?? null;
 
   if (!isWizardStep(step)) notFound();
 
@@ -62,7 +60,7 @@ export default async function ProjectWizardStepPage({
 
   if (result.status === "unavailable") {
     return (
-      <AppShell user={user}>
+      <AppShell user={user} showNewStore={false}>
         <div className="sp-animate-in mx-auto max-w-xl py-12">
           <FormAlert tone="error">
             We&apos;re having trouble reaching StorePilot&apos;s servers. Nothing you&apos;ve
@@ -80,7 +78,7 @@ export default async function ProjectWizardStepPage({
 
   if (result.status === "schema_missing") {
     return (
-      <AppShell user={user}>
+      <AppShell user={user} showNewStore={false}>
         <div className="sp-animate-in mx-auto max-w-xl py-12">
           <FormAlert tone="error">
             StorePilot&apos;s database hasn&apos;t been set up in this environment yet — the app
@@ -99,7 +97,7 @@ export default async function ProjectWizardStepPage({
 
   if (!result.data) {
     return (
-      <AppShell user={user}>
+      <AppShell user={user} showNewStore={false}>
         <div className="sp-animate-in mx-auto max-w-xl py-16 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">
             We couldn&apos;t find that store
@@ -118,8 +116,15 @@ export default async function ProjectWizardStepPage({
   const { project, profile } = result.data;
   const meta = getStep(step);
 
+  // DURABLE connection state — the single source of truth for "connected?"
+  // on the Connect step. Read from sp_shopify_connections via the safe
+  // get_connection_metadata RPC under the user's own session (RLS + ownership
+  // checked inside the function). Survives refresh, new tabs, sign-out and
+  // sign-in. `null` (error/schema-missing) fails closed to "not connected".
+  const connection = await getConnectionStatus(project.id);
+
   return (
-    <AppShell user={user}>
+    <AppShell user={user} showNewStore={false}>
       <WizardShell
         projectId={project.id}
         currentStep={step}
@@ -131,7 +136,8 @@ export default async function ProjectWizardStepPage({
           step={step}
           projectId={project.id}
           projectName={project.name}
-          shopifyResult={shopifyResult}
+          connection={connection ?? NO_CONNECTION}
+          oauthError={oauthError}
           profile={
             profile
               ? {

@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "check:css": "node scripts/check-css.mjs",
-    "test:shopify": "node scripts/shopify-connectivity-tests.mjs"
+    "test:shopify": "node scripts/shopify-connectivity-tests.mjs",
+    "test:shopify:tokens": "node --no-warnings --experimental-strip-types --conditions react-server --test scripts/shopify-token-lifecycle-tests.mts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

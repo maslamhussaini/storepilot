@@ -5,25 +5,44 @@ import { getShopifyEnv } from "@/lib/shopify/env";
 import { isValidShopDomain } from "@/lib/shopify/shop";
 import { verifyShopifyOAuthCallbackHmac } from "@/lib/shopify/hmac";
 import { readOAuthStateCookieValue, stateMatches, STATE_COOKIE_NAME } from "@/lib/shopify/state";
+import { ShopifyPersistenceError, storeShopifyTokens } from "@/lib/shopify/tokens";
 
 /**
  * GET /api/shopify/callback
  *
- * Phase 2B.2b connectivity spike ONLY: proves the real authorization
- * round-trip end-to-end (state, HMAC, shop, token exchange), then DISCARDS
- * the returned token pair and redirects back into the wizard with a
- * non-sensitive indicator. No persistence, no Vault, no Supabase writes here
- * — that is Phase 2B.3, once the full `sp_shopify_connections` + Vault design
- * (docs/PHASE2B2_PREFLIGHT_REPORT.md §4/§6) is actually implemented.
+ * Phase 2B.3B-1: turns a successful Shopify authorization round-trip into a
+ * DURABLE StorePilot connection. Validation order (unchanged from the 2B.2b
+ * spike, every check still fail-closed and uniform in what the browser sees):
+ *
+ *   1. state cookie valid (HMAC-signed with client secret, 10-min TTL, httpOnly)
+ *   2. `state` query == cookie nonce (constant-time)
+ *   3. shop domain valid
+ *   4. authorization code present
+ *   5. Shopify HMAC over the full callback query (constant-time)
+ *   6. server-side token exchange (`expiring: "1"` offline-token shape)
+ *   7. NEW: durable persistence via store_connection_tokens — Vault secret +
+ *      metadata + lifecycle event in ONE transaction (2B.3A primitive)
+ *   8. redirect to the Connect step with only a non-sensitive flag
+ *
+ * TRUSTED PROJECT BINDING (never from the query string): `projectId` comes
+ * exclusively from the signed state cookie, which was minted by the authorize
+ * route AFTER `requireUser()` + RLS-backed ownership verification. The DB
+ * function then re-derives ownership from `sp_projects` and the ownership
+ * trigger re-verifies it at write time.
+ *
+ * TOKEN NON-EXPOSURE: the token pair lives only inside the exchange block
+ * below, travels directly into the Vault whitelist inside the DB function,
+ * and is never placed in a redirect URL, API response body, log line, or
+ * React prop. The callback returns only 302 redirects.
  *
  * NOT in `src/proxy.ts`'s protected-prefix list, deliberately — see the
  * comment in proxy.ts. This handler's own state-cookie + HMAC checks ARE its
  * authentication; a StorePilot login redirect here would break the flow.
  *
  * Rejections are intentionally uniform: every failure path below redirects to
- * the same generic "connection couldn't be verified" state, never revealing
- * *which* check failed to the caller (state/HMAC/shop are logged server-side
- * for operator visibility, never surfaced to the client).
+ * the same generic "connection couldn't be verified" style state, never
+ * revealing *which* check failed (or any DB/Vault error detail) to the
+ * caller — reasons are logged server-side only, with sanitization.
  */
 export async function GET(request: NextRequest) {
   const env = getShopifyEnv();
@@ -51,6 +70,8 @@ export async function GET(request: NextRequest) {
     return clearStateCookie(NextResponse.redirect(errorUrl(request, null, "state_invalid")));
   }
 
+  // Trusted project/user binding — the ONLY source of project identity in
+  // this handler. Never re-read from `searchParams`.
   const projectId = statePayload.projectId;
 
   if (!callbackState || !stateMatches(callbackState, statePayload.nonce)) {
@@ -73,10 +94,18 @@ export async function GET(request: NextRequest) {
     return clearStateCookie(NextResponse.redirect(errorUrl(request, projectId, "hmac_invalid")));
   }
 
-  // All checks passed. Exchange the code for a token pair — this is the
-  // spike's actual proof of a real round-trip. The result is inspected only
-  // for non-secret metadata (§5 of the task) and then discarded; nothing is
-  // persisted, logged, or returned to the client in this phase.
+  // All request-side checks passed. Exchange the code for a token pair and
+  // persist it durably. `tokenPayload` is scoped to this handler invocation
+  // only; it is nulled out below and never logged, never URL-encoded, never
+  // returned in a body.
+  let tokenPayload: {
+    access_token: string;
+    refresh_token?: string;
+    expires_in?: number;
+    refresh_token_expires_in?: number;
+    scope?: string;
+  } | null = null;
+
   let tokenMeta: {
     hasAccessToken: boolean;
     hasRefreshToken: boolean;
@@ -114,18 +143,41 @@ export async function GET(request: NextRequest) {
       scope?: string;
     };
 
-    // Metadata only — never the token strings themselves, not even in a
-    // variable that outlives this block, and never logged.
+    // A. Extract ONLY fields the actual response contained (§7 of the task):
+    //    `access_token` is the one required field; every other field is
+    //    OPTIONAL and included strictly conditionally — a missing refresh
+    //    token is handled explicitly by its absence, never invented.
+    if (typeof body.access_token !== "string" || body.access_token.length === 0) {
+      console.error("[shopify callback] token exchange returned no access token", { projectId });
+      return clearStateCookie(
+        NextResponse.redirect(errorUrl(request, projectId, "token_exchange_failed")),
+      );
+    }
+
+    tokenPayload = { access_token: body.access_token };
+    if (typeof body.refresh_token === "string" && body.refresh_token.length > 0) {
+      tokenPayload.refresh_token = body.refresh_token;
+    }
+    if (typeof body.expires_in === "number") {
+      tokenPayload.expires_in = body.expires_in;
+    }
+    if (typeof body.refresh_token_expires_in === "number") {
+      tokenPayload.refresh_token_expires_in = body.refresh_token_expires_in;
+    }
+    if (typeof body.scope === "string") {
+      tokenPayload.scope = body.scope;
+    }
+
+    // Metadata only — booleans/numbers for the server log, never the strings.
     tokenMeta = {
-      hasAccessToken: typeof body.access_token === "string" && body.access_token.length > 0,
-      hasRefreshToken: typeof body.refresh_token === "string" && body.refresh_token.length > 0,
-      expiresIn: typeof body.expires_in === "number" ? body.expires_in : null,
-      refreshTokenExpiresIn:
-        typeof body.refresh_token_expires_in === "number" ? body.refresh_token_expires_in : null,
-      grantedScope: typeof body.scope === "string" ? body.scope : null,
+      hasAccessToken: true,
+      hasRefreshToken: tokenPayload.refresh_token !== undefined,
+      expiresIn: tokenPayload.expires_in ?? null,
+      refreshTokenExpiresIn: tokenPayload.refresh_token_expires_in ?? null,
+      grantedScope: tokenPayload.scope ?? null,
     };
-    // `body` (and therefore the real token values) goes out of scope here and
-    // is never referenced again — deliberate, not merely incidental.
+    // `body` goes out of scope here; only the whitelisted `tokenPayload`
+    // survives, and it is consumed by the persistence step immediately below.
   } catch (error) {
     console.error("[shopify callback] token exchange threw", { projectId, error });
     return clearStateCookie(
@@ -133,17 +185,51 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  console.info("[shopify callback] spike round-trip verified (token discarded)", {
+  // 7. DURABLE PERSISTENCE — exactly once, only after every check above
+  //    succeeded. One SECURITY DEFINER call = one transaction covering Vault
+  //    secret, connection metadata (installed/reconnected decided inside),
+  //    and the lifecycle event; a throw means NOTHING was written (fail
+  //    closed — no partial "connected without tokens" state is possible).
+  if (!tokenPayload) {
+    // Unreachable by construction; kept as a fail-closed guard so no code
+    // path can reach the success redirect without having persisted.
+    console.error("[shopify callback] internal: missing token payload", { projectId });
+    return clearStateCookie(
+      NextResponse.redirect(errorUrl(request, projectId, "token_exchange_failed")),
+    );
+  }
+
+  try {
+    await storeShopifyTokens(projectId, shop, tokenPayload);
+  } catch (error) {
+    // DB/Vault detail was already logged (sanitized) inside storeShopifyTokens.
+    // The BROWSER gets only this generic, non-sensitive reason code — never
+    // a Supabase/Vault message, never a constraint name, never token material.
+    console.error("[shopify callback] persistence failed", {
+      projectId,
+      shop,
+      reason: error instanceof ShopifyPersistenceError ? error.code : "unknown",
+    });
+    return clearStateCookie(
+      NextResponse.redirect(errorUrl(request, projectId, "persistence_failed")),
+    );
+  } finally {
+    tokenPayload = null; // token strings can no longer be referenced below
+  }
+
+  console.info("[shopify callback] connection persisted", {
     projectId,
     shop,
-    ...tokenMeta,
+    ...tokenMeta, // booleans/numbers only
   });
 
+  // 8. Success — a NON-SENSITIVE indication that the OAuth attempt returned.
+  //    Connected-status display is NEVER derived from this flag: the Connect
+  //    page re-reads durable metadata via get_connection_metadata instead.
   const successUrl = request.nextUrl.clone();
   successUrl.pathname = `/projects/${projectId}/wizard/connect`;
   successUrl.search = "";
-  successUrl.searchParams.set("shopify_spike", "ok");
-  successUrl.searchParams.set("shop", shop); // non-sensitive — the domain only, never a token
+  successUrl.searchParams.set("shopify_oauth", "ok");
   return clearStateCookie(NextResponse.redirect(successUrl));
 }
 

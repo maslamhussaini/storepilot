@@ -28,6 +28,15 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
+/** JSON column/argument shape used by supabase-js (mirrors PostgREST's Json). */
+export type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: Json | undefined }
+  | Json[];
+
 export type SpProject = {
   id: string;
   user_id: string;
@@ -110,7 +119,114 @@ export interface Database {
       };
     };
     Views: { [_ in never]: never };
-    Functions: { [_ in never]: never };
+    /**
+     * Phase 2B.3A SECURITY DEFINER functions (migration
+     * 20260921000200_create_shopify_security_definer_functions.sql).
+     * Signatures hand-maintained to match the actual SQL — EXECUTE grants are
+     * NOT expressible in types and are enforced in SQL (test scenario F):
+     *   store_connection_tokens / get_connection_tokens / revoke_connection_tokens
+     *     -> service_role ONLY (server-only callers)
+     *   get_connection_tokens_by_id / claim_connection_token_refresh /
+     *   complete_connection_token_refresh / release_connection_token_refresh /
+     *   mark_connection_reauth_required -> service_role ONLY (refresh lifecycle)
+     *   get_connection_metadata -> authenticated (+ service_role) — the safe
+     *     wizard read; ownership checked inside via auth.uid().
+     */
+    Functions: {
+      store_connection_tokens: {
+        Args: {
+          p_project_id: string;
+          p_shop_domain: string;
+          p_token_payload: Json;
+        };
+        Returns: string;
+      };
+      get_connection_metadata: {
+        Args: { p_project_id: string };
+        Returns: Array<{
+          shop_domain: string;
+          status: string;
+          granted_scopes: string[] | null;
+          installed_at: string | null;
+          disconnected_at: string | null;
+          last_verified_at: string | null;
+        }>;
+      };
+      get_connection_tokens: {
+        Args: { p_project_id: string };
+        Returns: Array<{
+          shop_domain: string;
+          access_token: string | null;
+          refresh_token: string | null;
+          access_token_expires_at: string | null;
+          refresh_token_expires_at: string | null;
+        }>;
+      };
+      get_connection_tokens_by_id: {
+        Args: { p_connection_id: string };
+        Returns: Array<{
+          connection_id: string;
+          project_id: string;
+          shop_domain: string;
+          status: string;
+          access_token: string | null;
+          refresh_token: string | null;
+          access_token_expires_at: string | null;
+          refresh_token_expires_at: string | null;
+          credential_version: number;
+          refresh_claim_id: string | null;
+          refresh_claim_expires_at: string | null;
+        }>;
+      };
+      claim_connection_token_refresh: {
+        Args: {
+          p_connection_id: string;
+          p_claim_id: string;
+          p_expected_version: number;
+          p_lease_seconds?: number;
+        };
+        Returns: Array<{
+          claim_result: string;
+          connection_id: string | null;
+          project_id: string | null;
+          shop_domain: string | null;
+          status: string | null;
+          access_token: string | null;
+          refresh_token: string | null;
+          access_token_expires_at: string | null;
+          refresh_token_expires_at: string | null;
+          credential_version: number | null;
+        }>;
+      };
+      complete_connection_token_refresh: {
+        Args: {
+          p_connection_id: string;
+          p_claim_id: string;
+          p_expected_version: number;
+          p_token_payload: Json;
+          p_reason?: string;
+          p_api_version?: string | null;
+        };
+        Returns: Array<{ result: string }>;
+      };
+      release_connection_token_refresh: {
+        Args: { p_connection_id: string; p_claim_id: string };
+        Returns: Array<{ result: string }>;
+      };
+      mark_connection_reauth_required: {
+        Args: {
+          p_connection_id: string;
+          p_claim_id: string;
+          p_expected_version: number;
+          p_reason?: string;
+        };
+        Returns: Array<{ result: string }>;
+      };
+      revoke_connection_tokens: {
+        Args: { p_project_id: string; p_reason?: string };
+        Returns: undefined;
+      };
+    };
     Enums: { [_ in never]: never };
     CompositeTypes: { [_ in never]: never };
   };
