@@ -191,7 +191,11 @@ class TokenStoreBoundaryError extends Error {
   }
 }
 
-type TokenLifecycleRow = {
+/**
+ * The persisted token-pair columns shared by both trusted RPC projections.
+ * Every column here IS declared in the `RETURNS TABLE` of both functions.
+ */
+type TokenPairRow = {
   connection_id: string;
   project_id: string;
   shop_domain: string;
@@ -201,14 +205,35 @@ type TokenLifecycleRow = {
   access_token_expires_at: string | null;
   refresh_token_expires_at: string | null;
   credential_version: number;
+};
+
+/** `get_connection_tokens_by_id` returns the pair PLUS the lease columns. */
+type TokenLifecycleRow = TokenPairRow & {
   refresh_claim_id: string | null;
   refresh_claim_expires_at: string | null;
 };
 
-type ClaimLifecycleRow = TokenLifecycleRow & {
+/**
+ * `claim_connection_token_refresh` returns ONLY the pair + `claim_result`.
+ *
+ * Its `RETURNS TABLE` does NOT declare `refresh_claim_id` /
+ * `refresh_claim_expires_at`, and PostgREST omits undeclared OUT columns
+ * entirely — those keys are ABSENT from the JSON, not null. This type makes
+ * that contract explicit: indexing lease fields from a claim row would yield
+ * `undefined`, which the previous generic mapper fed into date parsing and
+ * misclassified as a store failure — the exact root cause of the 2B.3B-2A
+ * production `persistence_failed` (adapter threw AFTER the database lease
+ * had been acquired, so the claim was never released).
+ */
+type ClaimLifecycleRow = TokenPairRow & {
   claim_result: string;
 };
 
+/**
+ * Strict by design: `null` means the column was declared and empty;
+ * `undefined` (an undeclared column) reaching this helper means the SQL
+ * contract drifted, and must fail closed rather than silently refresh forever.
+ */
 function parseExpiry(value: string | null): Date | null {
   if (value === null) return null;
   const parsed = new Date(value);
@@ -216,14 +241,19 @@ function parseExpiry(value: string | null): Date | null {
   return parsed;
 }
 
-function mapTokenRecord(row: TokenLifecycleRow): ShopifyTokenRecord {
+function validateTokenPair(row: TokenPairRow): void {
   if (
     !Number.isSafeInteger(row.credential_version) ||
     row.credential_version < 1
   ) {
     throw new TokenStoreBoundaryError();
   }
+}
 
+function mapTokenPair(row: TokenPairRow): Omit<
+  ShopifyTokenRecord,
+  "refreshClaimId" | "refreshClaimExpiresAt"
+> {
   return {
     connectionId: row.connection_id,
     projectId: row.project_id,
@@ -234,12 +264,48 @@ function mapTokenRecord(row: TokenLifecycleRow): ShopifyTokenRecord {
     accessTokenExpiresAt: parseExpiry(row.access_token_expires_at),
     refreshTokenExpiresAt: parseExpiry(row.refresh_token_expires_at),
     credentialVersion: row.credential_version,
+  };
+}
+
+/** Full trusted-read projection (11 columns, including the lease pair). */
+function mapTokenRecord(row: TokenLifecycleRow): ShopifyTokenRecord {
+  validateTokenPair(row);
+  return {
+    ...mapTokenPair(row),
     refreshClaimId: row.refresh_claim_id,
     refreshClaimExpiresAt: parseExpiry(row.refresh_claim_expires_at),
   };
 }
 
-function createTokenStore(supabase: SupabaseClient<Database>): ShopifyTokenStore {
+/**
+ * Claim-response projection (10 columns — NO lease pair). The lease fields
+ * are recorded as `null` instead of invented: this RPC does not return them,
+ * the database is the lease authority, and the lifecycle never reads lease
+ * fields from a claim result.
+ */
+function mapClaimRecord(row: ClaimLifecycleRow): ShopifyTokenRecord {
+  validateTokenPair(row);
+  return {
+    ...mapTokenPair(row),
+    refreshClaimId: null,
+    refreshClaimExpiresAt: null,
+  };
+}
+
+/**
+ * Builds the real PostgREST-backed token store around a service-role client.
+ *
+ * EXPORTED FOR SERVER-ONLY TESTS: the module is `import "server-only"`, so a
+ * Client Component import remains a BUILD error. Regression tests construct it
+ * with a fake Supabase client (contract tests) or a local-stack client
+ * (integration tests) so the real RPC parameter names, response projection,
+ * and error classification are exercised without touching production or a
+ * real Shopify request. `getValidAccessToken` remains the sanctioned
+ * production entry point.
+ */
+export function createShopifyTokenStore(
+  supabase: SupabaseClient<Database>,
+): ShopifyTokenStore {
   return {
     async get(connectionId) {
       const { data, error } = await supabase.rpc("get_connection_tokens_by_id", {
@@ -262,7 +328,7 @@ function createTokenStore(supabase: SupabaseClient<Database>): ShopifyTokenStore
       if (!row) return { result: "not_found" };
 
       if (row.claim_result === "claimed") {
-        return { result: "claimed", record: mapTokenRecord(row) };
+        return { result: "claimed", record: mapClaimRecord(row) };
       }
       if (
         row.claim_result === "not_found" ||
@@ -400,7 +466,7 @@ export async function getValidAccessToken(
 
   return getValidAccessTokenWithStore({
     connectionId,
-    store: createTokenStore(supabase),
+    store: createShopifyTokenStore(supabase),
     transport: createShopifyRefreshTransport(),
     clientId: env.clientId,
     clientSecret: env.clientSecret,

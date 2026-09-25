@@ -10,6 +10,7 @@ import {
   type ShopifyTokenRecord,
   type ShopifyTokenStore,
 } from "../src/lib/shopify/token-lifecycle.ts";
+import { createShopifyTokenStore } from "../src/lib/shopify/tokens.ts";
 
 const CONNECTION_ID = "11111111-1111-4111-8111-111111111111";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
@@ -566,4 +567,454 @@ test("O. response parser accepts optional refresh expiry and rejects malformed v
       }),
     (error: unknown) => error instanceof ShopifyTokenLifecycleError && error.code === "invalid_refresh_response",
   );
+});
+
+// ===========================================================================
+// Phase 2B.3B-2B — production-shaped adapter contract & claim-cleanup coverage
+//
+// These tests exercise the REAL server-only adapter (`tokens.ts`) through a
+// fake supabase-js client whose responses are shaped exactly like the real
+// PostgREST projection of each RPC. Provenance: the claim row below is the
+// literal key set captured from the local PostgREST response of
+// `claim_connection_token_refresh` (10 keys — the SQL RETURNS TABLE does not
+// declare the lease columns, and PostgREST omits undeclared OUT columns).
+//
+// The 2B.3B-2A production incident: the generic row mapper fed the absent
+// `refresh_claim_expires_at` into date parsing as `undefined`, which threw
+// a boundary error INSIDE `store.claim()` — after the database lease was
+// already acquired — so the lifecycle classified it `persistence_failed`,
+// never reached the transport, and never released the claim.
+// ===========================================================================
+
+type StoreClient = Parameters<typeof createShopifyTokenStore>[0];
+
+interface RpcCall {
+  fn: string;
+  params: Record<string, unknown>;
+}
+
+/** Scripted fake: rows resolve as data, `error` resolves as an RPC error. */
+function fakeClient(
+  script: Record<string, { rows: unknown[] } | { error: { message: string } }>,
+): { client: StoreClient; calls: RpcCall[] } {
+  const calls: RpcCall[] = [];
+  const client = {
+    rpc: async (fn: string, params: Record<string, unknown> = {}) => {
+      calls.push({ fn, params });
+      const entry = script[fn];
+      if (entry === undefined) {
+        throw new Error(`fake supabase: unexpected rpc ${fn}`);
+      }
+      if ("error" in entry) return { data: null, error: entry.error };
+      return { data: entry.rows, error: null };
+    },
+  };
+  return { client: client as unknown as StoreClient, calls };
+}
+
+/**
+ * Exact key set of the production PostgREST response for
+ * `claim_connection_token_refresh` — NO `refresh_claim_id` /
+ * `refresh_claim_expires_at` keys exist here by contract.
+ */
+const PRODUCTION_CLAIM_ROW = {
+  claim_result: "claimed",
+  connection_id: CONNECTION_ID,
+  project_id: PROJECT_ID,
+  shop_domain: SHOP_DOMAIN,
+  status: "connected",
+  access_token: "fake-access-current",
+  refresh_token: "fake-refresh-current",
+  access_token_expires_at: "2026-09-24T11:00:00.000Z",
+  refresh_token_expires_at: "2026-10-01T12:00:00.000Z",
+  credential_version: 1,
+};
+
+/** `get_connection_tokens_by_id` DOES return the lease columns (11 keys). */
+const PRODUCTION_GET_ROW = {
+  connection_id: CONNECTION_ID,
+  project_id: PROJECT_ID,
+  shop_domain: SHOP_DOMAIN,
+  status: "connected",
+  access_token: "fake-access-current",
+  refresh_token: "fake-refresh-current",
+  access_token_expires_at: "2026-09-24T11:00:00.000Z", // expired vs NOW
+  refresh_token_expires_at: "2026-10-01T12:00:00.000Z",
+  credential_version: 1,
+  refresh_claim_id: null,
+  refresh_claim_expires_at: null,
+};
+
+function countFn(calls: RpcCall[], fn: string): number {
+  return calls.filter((call) => call.fn === fn).length;
+}
+
+test("2B-A. production-shaped claim RPC response maps to a claimed record", async () => {
+  // Fixture guard: the claim row must never accidentally gain lease keys.
+  assert.ok(!("refresh_claim_id" in PRODUCTION_CLAIM_ROW));
+  assert.ok(!("refresh_claim_expires_at" in PRODUCTION_CLAIM_ROW));
+
+  const { client, calls } = fakeClient({
+    claim_connection_token_refresh: { rows: [PRODUCTION_CLAIM_ROW] },
+  });
+  const store = createShopifyTokenStore(client);
+  const result = await store.claim({
+    connectionId: CONNECTION_ID,
+    claimId: "claim-2b-a",
+    expectedVersion: 1,
+    leaseSeconds: 60,
+  });
+  assert.equal(result.result, "claimed");
+  if (result.result !== "claimed") return;
+  assert.equal(result.record.credentialVersion, 1);
+  assert.equal(result.record.accessToken, "fake-access-current");
+  assert.equal(result.record.refreshToken, "fake-refresh-current");
+  assert.equal(result.record.accessTokenExpiresAt?.toISOString(), "2026-09-24T11:00:00.000Z");
+  // The claim RPC returns no lease columns; the record must not invent them.
+  assert.equal(result.record.refreshClaimId, null);
+  assert.equal(result.record.refreshClaimExpiresAt, null);
+  // Exact production parameter names.
+  assert.deepEqual(calls, [
+    {
+      fn: "claim_connection_token_refresh",
+      params: {
+        p_connection_id: CONNECTION_ID,
+        p_claim_id: "claim-2b-a",
+        p_expected_version: 1,
+        p_lease_seconds: 60,
+      },
+    },
+  ]);
+});
+
+test("2B-A2. production-shaped trusted read response maps every persisted column", async () => {
+  const { client } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+  });
+  const store = createShopifyTokenStore(client);
+  const record = await store.get(CONNECTION_ID);
+  assert.ok(record);
+  assert.equal(record.credentialVersion, 1);
+  assert.equal(record.shopDomain, SHOP_DOMAIN);
+  assert.equal(record.accessTokenExpiresAt?.toISOString(), "2026-09-24T11:00:00.000Z");
+  assert.equal(record.refreshClaimId, null);
+  assert.equal(record.refreshClaimExpiresAt, null);
+});
+
+test("2B-B. persistence read success -> claim -> transport once -> complete contract", async () => {
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+    claim_connection_token_refresh: { rows: [PRODUCTION_CLAIM_ROW] },
+    complete_connection_token_refresh: { rows: [{ result: "completed" }] },
+  });
+  const transportCalls: string[] = [];
+  const result = await getValidAccessTokenWithStore({
+    connectionId: CONNECTION_ID,
+    store: createShopifyTokenStore(client),
+    transport: {
+      refresh: async (input) => {
+        transportCalls.push(input.refreshToken);
+        return { kind: "success", body: refreshedPayload };
+      },
+    },
+    clientId: "fake-client",
+    clientSecret: "fake-secret",
+    apiVersion: "2026-07",
+    now: () => NOW,
+    newClaimId: () => "claim-2b-b",
+  });
+  assert.equal(result.refreshed, true);
+  assert.equal(result.accessToken, "fake-access-rotated");
+  assert.deepEqual(transportCalls, ["fake-refresh-current"]);
+  assert.deepEqual(
+    calls.map((call) => call.fn),
+    [
+      "get_connection_tokens_by_id",
+      "claim_connection_token_refresh",
+      "complete_connection_token_refresh",
+    ],
+  );
+  const complete = calls[2];
+  assert.equal(complete.params.p_connection_id, CONNECTION_ID);
+  assert.equal(complete.params.p_claim_id, "claim-2b-b");
+  assert.equal(complete.params.p_expected_version, 1);
+  assert.equal(complete.params.p_reason, "expired");
+  assert.equal(complete.params.p_api_version, "2026-07");
+  assert.deepEqual(Object.keys(complete.params.p_token_payload as object), [
+    "access_token",
+    "refresh_token",
+    "expires_in",
+    "refresh_token_expires_in",
+  ]);
+});
+
+test("2B-C. persistence read failure fails closed before any claim or transport", async () => {
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { error: { message: "fake database error" } },
+  });
+  const transportCalls: unknown[] = [];
+  await expectCode(
+    getValidAccessTokenWithStore({
+      connectionId: CONNECTION_ID,
+      store: createShopifyTokenStore(client),
+      transport: {
+        refresh: async () => {
+          transportCalls.push(1);
+          return { kind: "success", body: refreshedPayload };
+        },
+      },
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      apiVersion: "2026-07",
+      now: () => NOW,
+      newClaimId: () => "claim-2b-c",
+    }),
+    "persistence_failed",
+  );
+  assert.deepEqual(calls.map((call) => call.fn), ["get_connection_tokens_by_id"]);
+  assert.equal(transportCalls.length, 0);
+});
+
+test("2B-D. post-lease claim failure explicitly releases THAT claim", async () => {
+  // The claim RPC succeeds server-side (lease acquired) but response mapping
+  // fails afterwards — credential_version 0 is invalid, so the adapter throws
+  // after the lease exists. This is the exact structural shape of the 2B.3B-2A
+  // production incident (mapping failure inside store.claim()).
+  const brokenClaimRow = { ...PRODUCTION_CLAIM_ROW, credential_version: 0 };
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+    claim_connection_token_refresh: { rows: [brokenClaimRow] },
+    release_connection_token_refresh: { rows: [{ result: "released" }] },
+  });
+  const transportCalls: unknown[] = [];
+  await expectCode(
+    getValidAccessTokenWithStore({
+      connectionId: CONNECTION_ID,
+      store: createShopifyTokenStore(client),
+      transport: {
+        refresh: async () => {
+          transportCalls.push(1);
+          return { kind: "success", body: refreshedPayload };
+        },
+      },
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      apiVersion: "2026-07",
+      now: () => NOW,
+      newClaimId: () => "claim-2b-d",
+    }),
+    "persistence_failed",
+  );
+  const release = calls.find((call) => call.fn === "release_connection_token_refresh");
+  assert.ok(release, "explicit release must be attempted after a post-lease failure");
+  assert.deepEqual(release.params, {
+    p_connection_id: CONNECTION_ID,
+    p_claim_id: "claim-2b-d",
+  });
+  assert.equal(transportCalls.length, 0);
+});
+
+test("2B-E. release after a claim failure is scoped to this attempt's claim id", async () => {
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+    claim_connection_token_refresh: { error: { message: "fake claim error" } },
+    release_connection_token_refresh: { rows: [{ result: "released" }] },
+  });
+  await expectCode(
+    getValidAccessTokenWithStore({
+      connectionId: CONNECTION_ID,
+      store: createShopifyTokenStore(client),
+      transport: { refresh: async () => ({ kind: "success", body: refreshedPayload }) },
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      apiVersion: "2026-07",
+      now: () => NOW,
+      newClaimId: () => "claim-2b-e",
+    }),
+    "persistence_failed",
+  );
+  const releases = calls.filter((call) => call.fn === "release_connection_token_refresh");
+  assert.equal(releases.length, 1, "exactly one release attempt");
+  assert.deepEqual(releases[0].params, {
+    p_connection_id: CONNECTION_ID,
+    p_claim_id: "claim-2b-e",
+  });
+});
+
+test("2B-F. release failure never masks the original failure classification", async () => {
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+    claim_connection_token_refresh: { error: { message: "fake claim error" } },
+    release_connection_token_refresh: {
+      error: { message: "shpss_fake_secret_from_release_error" },
+    },
+  });
+  const warns: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warns.push(args);
+  };
+  try {
+    await expectCode(
+      getValidAccessTokenWithStore({
+        connectionId: CONNECTION_ID,
+        store: createShopifyTokenStore(client),
+        transport: { refresh: async () => ({ kind: "success", body: refreshedPayload }) },
+        clientId: "fake-client",
+        clientSecret: "fake-secret",
+        apiVersion: "2026-07",
+        now: () => NOW,
+        newClaimId: () => "claim-2b-f",
+      }),
+      "persistence_failed",
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(countFn(calls, "release_connection_token_refresh"), 1, "release was attempted");
+  // Safe diagnostic metadata only: the upstream error text never reaches logs.
+  assert.ok(warns.length >= 1, "a release failure reports safe diagnostics");
+  const flat = JSON.stringify(warns);
+  assert.ok(!flat.includes("shpss_"), "diagnostics must never contain secret material");
+  assert.ok(!flat.includes("fake claim error"), "diagnostics must never echo upstream text");
+  assert.ok(flat.includes(CONNECTION_ID) && flat.includes("claim-2b-f"), "diagnostics carry safe ids only");
+});
+
+test("2B-G. transport is never invoked after a persistence failure", async () => {
+  const brokenClaimRow = { ...PRODUCTION_CLAIM_ROW, credential_version: 0 };
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+    claim_connection_token_refresh: { rows: [brokenClaimRow] },
+    release_connection_token_refresh: { rows: [{ result: "released" }] },
+  });
+  let transportCalls = 0;
+  await expectCode(
+    getValidAccessTokenWithStore({
+      connectionId: CONNECTION_ID,
+      store: createShopifyTokenStore(client),
+      transport: {
+        refresh: async () => {
+          transportCalls += 1;
+          return { kind: "success", body: refreshedPayload };
+        },
+      },
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      apiVersion: "2026-07",
+      now: () => NOW,
+      newClaimId: () => "claim-2b-g",
+    }),
+    "persistence_failed",
+  );
+  assert.equal(transportCalls, 0);
+  assert.equal(countFn(calls, "complete_connection_token_refresh"), 0);
+});
+
+test("2B-H. successful fake end-to-end refresh still rotates atomically", async () => {
+  const store = new FakeTokenStore(makeRecord({ accessTokenExpiresAt: plusSeconds(-5) }));
+  const calls: Array<{ shopDomain: string; refreshToken: string }> = [];
+  const result = await getValidAccessTokenWithStore({
+    connectionId: CONNECTION_ID,
+    store,
+    transport: successTransport(refreshedPayload, calls),
+    clientId: "fake-client",
+    clientSecret: "fake-secret",
+    apiVersion: "2026-07",
+    now: () => NOW,
+    newClaimId: () => "claim-2b-h",
+  });
+  assert.equal(result.refreshed, true);
+  assert.equal(calls.length, 1);
+  // Atomic rotation outcomes: generation +1, claim cleared by completion,
+  // exactly one event, and no release needed (completion consumed the lease).
+  assert.equal(store.record.credentialVersion, 2);
+  assert.equal(store.record.refreshClaimId, null);
+  assert.equal(store.record.refreshClaimExpiresAt, null);
+  assert.equal(store.events.length, 1);
+  assert.equal(store.events[0].type, "token_refreshed");
+  assert.equal(store.releaseCalls, 0);
+});
+
+test("2B-I. a stale worker never releases the current worker's claim", async () => {
+  const { client, calls } = fakeClient({
+    get_connection_tokens_by_id: { rows: [PRODUCTION_GET_ROW] },
+    claim_connection_token_refresh: {
+      rows: [{ ...PRODUCTION_CLAIM_ROW, claim_result: "already_claimed" }],
+    },
+  });
+  let transportCalls = 0;
+  await expectCode(
+    getValidAccessTokenWithStore({
+      connectionId: CONNECTION_ID,
+      store: createShopifyTokenStore(client),
+      transport: {
+        refresh: async () => {
+          transportCalls += 1;
+          return { kind: "success", body: refreshedPayload };
+        },
+      },
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      apiVersion: "2026-07",
+      now: () => NOW,
+      newClaimId: () => "claim-2b-i",
+    }),
+    "refresh_in_progress",
+  );
+  assert.equal(countFn(calls, "release_connection_token_refresh"), 0);
+  assert.equal(transportCalls, 0);
+});
+
+test("2B-J. failure diagnostics never expose token material", async () => {
+  // Adapter boundary: upstream error text is replaced by a fixed message.
+  const { client } = fakeClient({
+    get_connection_tokens_by_id: { error: { message: "shpss_fake_secret_in_upstream_error" } },
+  });
+  const adapterStore = createShopifyTokenStore(client);
+  await assert.rejects(
+    () => adapterStore.get(CONNECTION_ID),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.name === "TokenStoreBoundaryError" &&
+      error.message === "Shopify token store boundary failed" &&
+      !error.message.includes("shpss_"),
+  );
+
+  // Lifecycle: a store throwing secret-bearing text still yields the fixed,
+  // code-only error message.
+  const secretStore: ShopifyTokenStore = {
+    async get() {
+      throw new Error("fake-access-supersecret-value");
+    },
+    async claim() {
+      return { result: "not_found" as const };
+    },
+    async complete() {
+      return "stale" as const;
+    },
+    async release() {
+      throw new Error("shpss_fake_secret_release_value");
+    },
+    async markReauthRequired() {
+      return "stale" as const;
+    },
+  };
+  try {
+    await getValidAccessTokenWithStore({
+      connectionId: CONNECTION_ID,
+      store: secretStore,
+      transport: { refresh: async () => ({ kind: "success", body: refreshedPayload }) },
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      apiVersion: "2026-07",
+      now: () => NOW,
+    });
+    assert.fail("expected persistence_failed");
+  } catch (error) {
+    assert.ok(error instanceof ShopifyTokenLifecycleError);
+    assert.equal(error.code, "persistence_failed");
+    assert.equal(error.message, "Shopify token lifecycle failed: persistence_failed");
+    assert.ok(!error.message.includes("supersecret"));
+    assert.ok(!error.message.includes("shpss_"));
+  }
 });

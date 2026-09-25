@@ -287,6 +287,81 @@ select pg_temp.sp_assert(
   'F.2 releasing a transient claim preserves connected status and emits no reauth event'
 );
 
+-- ---------------------------------------------------------------------------
+-- Phase 2B.3B-2B: claim-id scoping, clean release, and the claim-RPC contract
+-- ---------------------------------------------------------------------------
+
+-- F.3 setup: a fresh lease held by "this worker".
+select pg_temp.sp_assert(
+  (select claim_result
+   from public.claim_connection_token_refresh(
+     (select id from public.sp_shopify_connections
+      where project_id = 'f1111111-1111-4111-8111-111111111111'),
+     '99999999-9999-4999-8999-999999999999', 3, 60
+   )) = 'claimed',
+  'F.3 stale-release scoping setup obtains a lease'
+);
+
+-- F.4 a stale worker releasing with a DIFFERENT claim id must be refused
+--     (not_owner) and must leave the current worker's claim untouched.
+select pg_temp.sp_assert(
+  (select result
+   from public.release_connection_token_refresh(
+     (select id from public.sp_shopify_connections
+      where project_id = 'f1111111-1111-4111-8111-111111111111'),
+     '88888888-8888-4888-8888-888888888888'
+   )) = 'not_owner'
+  and (select refresh_claim_id
+       from public.sp_shopify_connections
+       where project_id = 'f1111111-1111-4111-8111-111111111111')
+      = '99999999-9999-4999-8999-999999999999',
+  'F.4 a stale worker cannot release another worker''s claim'
+);
+
+-- F.5a the owner releases its own claim (mutation happens in its own
+--      statement — later reads must use a NEW statement to observe it).
+select pg_temp.sp_assert(
+  (select result
+   from public.release_connection_token_refresh(
+     (select id from public.sp_shopify_connections
+      where project_id = 'f1111111-1111-4111-8111-111111111111'),
+     '99999999-9999-4999-8999-999999999999'
+   )) = 'released',
+  'F.5 the owner releases its own claim'
+);
+
+-- F.5b residue check in a SEPARATE statement: no claim fields left behind,
+--      status and generation untouched.
+select pg_temp.sp_assert(
+  (select refresh_claim_id
+       from public.sp_shopify_connections
+       where project_id = 'f1111111-1111-4111-8111-111111111111') is null
+  and (select refresh_claim_expires_at
+       from public.sp_shopify_connections
+       where project_id = 'f1111111-1111-4111-8111-111111111111') is null
+  and (select credential_version
+       from public.sp_shopify_connections
+       where project_id = 'f1111111-1111-4111-8111-111111111111') = 3
+  and (select status
+       from public.sp_shopify_connections
+       where project_id = 'f1111111-1111-4111-8111-111111111111') = 'connected',
+  'F.5b release leaves no claim residue and keeps status and generation'
+);
+
+-- F.6 contract guard: the claim RPC must project EXACTLY what the adapter
+--     expects — credential_version present, lease columns ABSENT (PostgREST
+--     omits undeclared OUT columns; indexing them was the 2B.3B-2A root
+--     cause of persistence_failed with a leaked lease).
+select pg_temp.sp_assert(
+  pg_get_function_result(
+    'public.claim_connection_token_refresh(uuid, uuid, bigint, integer)'::regprocedure
+  ) like '%credential_version%'
+  and pg_get_function_result(
+    'public.claim_connection_token_refresh(uuid, uuid, bigint, integer)'::regprocedure
+  ) not like '%refresh_claim%',
+  'F.6 claim RPC returns the adapter contract: no lease columns in its projection'
+);
+
 -- ===========================================================================
 -- G. Invalid refresh credential transitions once to reauth_required
 -- ===========================================================================

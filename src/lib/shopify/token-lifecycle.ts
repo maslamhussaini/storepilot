@@ -226,8 +226,15 @@ async function releaseQuietly(
   try {
     await store.release({ connectionId, claimId });
   } catch {
-    // The lease is the durable fallback. A failed cleanup must not mask the
-    // original, non-sensitive lifecycle result.
+    // The lease is the durable fallback: if this cleanup fails, the claim
+    // expires on its own and the row is never left permanently locked. The
+    // failed release must not mask the original lifecycle classification.
+    // Report only safe diagnostic metadata (ids) — never the caught error's
+    // text (it can carry upstream messages) and never any credential.
+    console.warn(
+      "[shopify lifecycle] claim release failed; lease expiry remains the durable fallback",
+      { connectionId, claimId },
+    );
   }
 }
 
@@ -298,6 +305,7 @@ export async function getValidAccessTokenWithStore(input: {
   try {
     current = await input.store.get(input.connectionId);
   } catch {
+    // No claim was attempted here — this is the pre-claim read failing.
     throw new ShopifyTokenLifecycleError("persistence_failed", true);
   }
 
@@ -324,6 +332,14 @@ export async function getValidAccessTokenWithStore(input: {
       leaseSeconds,
     });
   } catch {
+    // The lease may already exist server-side: `store.claim()` can fail AFTER
+    // the database granted the lease (e.g. while mapping the trusted RPC
+    // response — the 2B.3B-2A incident, where the claim row's absent lease
+    // columns threw inside the adapter). Release is scoped to THIS attempt's
+    // claim id: it clears only a lease this call acquired and is a no-op
+    // otherwise, so it can never release another worker's claim. A failed
+    // release must not mask the original classification.
+    await releaseQuietly(input.store, input.connectionId, claimId);
     throw new ShopifyTokenLifecycleError("persistence_failed", true);
   }
 
@@ -374,10 +390,14 @@ export async function getValidAccessTokenWithStore(input: {
         expectedVersion: claimed.credentialVersion,
         reason: "missing_refresh_token",
       });
-      claimActive = false;
       if (isReauthMutationResult(reauthResult)) {
+        // The terminal reauth transition consumed the claim inside the same
+        // transaction — nothing left to release.
+        claimActive = false;
         throw new ShopifyTokenLifecycleError("reauth_required");
       }
+      // Non-terminal result: the claim may still be held; keep it active so
+      // the finally block performs the claim-id-scoped release.
       throw new ShopifyTokenLifecycleError("persistence_failed", true);
     }
 
@@ -399,10 +419,12 @@ export async function getValidAccessTokenWithStore(input: {
           expectedVersion: claimed.credentialVersion,
           reason: "invalid_refresh_token",
         });
-        claimActive = false;
         if (isReauthMutationResult(reauthResult)) {
+          // Terminal reauth transition consumed the claim — nothing to release.
+          claimActive = false;
           throw new ShopifyTokenLifecycleError("reauth_required");
         }
+        // Non-terminal result: keep the claim active for scoped release.
         throw new ShopifyTokenLifecycleError("persistence_failed", true);
       }
       if (refreshResult.status === 429 || refreshResult.status >= 500) {
@@ -428,9 +450,11 @@ export async function getValidAccessTokenWithStore(input: {
       reason,
       apiVersion: input.apiVersion,
     });
-    claimActive = false;
 
     if (completeResult === "completed") {
+      // Completion consumed the claim inside the same transaction that
+      // rotated the token — release must NOT run afterwards.
+      claimActive = false;
       return {
         connectionId: input.connectionId,
         shopDomain: claimed.shopDomain,

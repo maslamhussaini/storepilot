@@ -870,4 +870,55 @@ test("token lifecycle: deterministic SQL and application suites are present", ()
   assertSourceContains("package.json", '"test:shopify:tokens"', "application test script");
 });
 
+// ---------------------------------------------------------------------------
+// Phase 2B.3B-2B regression guards (production incident 2B.3B-2A)
+// ---------------------------------------------------------------------------
+
+test("token lifecycle: claim adapter never indexes lease columns from a claim row", () => {
+  // The claim RPC's RETURNS TABLE omits the lease columns and PostgREST omits
+  // undeclared OUT columns entirely — the claim row type must mirror exactly
+  // that projection (pair + claim_result, nothing else).
+  assertSourceContains(
+    TOKENS_MODULE,
+    "type ClaimLifecycleRow = TokenPairRow & {",
+    "claim row type is the lease-free projection",
+  );
+  assertSourceContains(
+    TOKENS_MODULE,
+    "claim_result: string;",
+    "claim row type carries claim_result",
+  );
+  assertSourceContains(
+    TOKENS_MODULE,
+    "record: mapClaimRecord(row)",
+    "claim responses map through the claim-specific mapper",
+  );
+  assertSourceContains(
+    TOKENS_MODULE,
+    "refreshClaimId: null,",
+    "claim records do not invent lease values",
+  );
+});
+
+test("token lifecycle: claim acquisition failure releases that claim before failing", () => {
+  const clean = stripComments(readFileSync(TOKEN_LIFECYCLE_MODULE, "utf8"));
+  // Exactly two release sites: the post-lease claim-failure catch AND the
+  // claim-active finally block — never a third unscoped path.
+  assert.equal(
+    countOccurrences(clean, "releaseQuietly(input.store, input.connectionId, claimId)"),
+    2,
+    "claim-failure release and claim-active finally release",
+  );
+  assertSourceContains(
+    TOKEN_LIFECYCLE_MODULE,
+    "[shopify lifecycle] claim release failed",
+    "release failures report safe diagnostics only",
+  );
+  assertSourceContains(
+    TOKEN_LIFECYCLE_MODULE,
+    "console.warn(",
+    "diagnostics are warn-level and id-only",
+  );
+});
+
 console.log(`\n${passed} assertions passed.`);

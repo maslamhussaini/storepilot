@@ -9,7 +9,8 @@
     "lint": "eslint",
     "check:css": "node scripts/check-css.mjs",
     "test:shopify": "node scripts/shopify-connectivity-tests.mjs",
-    "test:shopify:tokens": "node --no-warnings --experimental-strip-types --conditions react-server --test scripts/shopify-token-lifecycle-tests.mts"
+    "test:shopify:tokens": "node --no-warnings --experimental-strip-types --conditions react-server --import ./scripts/register-ts-alias.mjs --test scripts/shopify-token-lifecycle-tests.mts",
+    "test:shopify:tokens:local": "node --no-warnings --experimental-strip-types --conditions react-server --import ./scripts/register-ts-alias.mjs --test scripts/shopify-token-local-integration-tests.mts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
