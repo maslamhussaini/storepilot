@@ -3,6 +3,7 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { getShopifyEnv } from "@/lib/shopify/env";
+import { getServiceRoleClient, isServiceRoleConfigured } from "@/lib/supabase/service";
 import {
   getValidAccessTokenWithStore,
   ShopifyTokenLifecycleError,
@@ -28,10 +29,10 @@ import type { Database, Json } from "@/lib/supabase/types";
  * SECURITY INVARIANTS (all load-bearing):
  *   * `import "server-only"` — a Client Component import is a BUILD error,
  *     not a runtime leak.
- *   * `SUPABASE_SERVICE_ROLE_KEY` is read ONLY here (server-only module),
- *     never from `src/lib/supabase/env.ts` (which is shared with client code
- *     and must therefore only ever touch `NEXT_PUBLIC_*`), and never from a
- *     `NEXT_PUBLIC_*` variable.
+ *   * `SUPABASE_SERVICE_ROLE_KEY` is read ONLY in `src/lib/supabase/service.ts`
+ *     (server-only module), never from `src/lib/supabase/env.ts` (which is
+ *     shared with client code and must therefore only ever touch
+ *     `NEXT_PUBLIC_*`), and never from a `NEXT_PUBLIC_*` variable.
  *   * `auth: { persistSession: false }` — this client must never write
  *     cookies or attempt token refresh; it is a pure server credential.
  *   * The only value-returning lifecycle operation is `getValidAccessToken`,
@@ -42,41 +43,6 @@ import type { Database, Json } from "@/lib/supabase/types";
  * metadata reads use the user-session path (`src/lib/shopify/connections.ts`),
  * never this client.
  */
-
-/** Trimmed at the boundary to guard against CR/LF contamination from env UIs. */
-function getServiceRoleEnv(): { url: string; serviceRoleKey: string } | null {
-  // NEXT_PUBLIC_SUPABASE_URL is public by design (it is inlined into the
-  // browser bundle anyway); reading it server-side is safe and avoids a
-  // second, divergent URL variable.
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
-
-  if (!url || !serviceRoleKey) return null;
-  return { url, serviceRoleKey };
-}
-
-/**
- * Returns a service-role client, or `null` when the server credential is not
- * configured. Callers must fail CLOSED on `null` (refuse to report success),
- * never fall back to the anon key.
- */
-function getServiceRoleClient(): SupabaseClient<Database> | null {
-  const env = getServiceRoleEnv();
-  if (!env) return null;
-
-  return createClient<Database>(env.url, env.serviceRoleKey, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false,
-    },
-  });
-}
-
-/** True when the service-role server credential is configured. */
-export function isServiceRoleConfigured(): boolean {
-  return getServiceRoleEnv() !== null;
-}
 
 /**
  * The token material handed to `store_connection_tokens`. Every field except

@@ -4,11 +4,13 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth/dal";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { getServiceRoleClient } from "@/lib/supabase/service";
 import { isUuid } from "@/lib/projects/ids";
 import { isWizardStep, progressAfter, wizardPath } from "@/lib/wizard/steps";
 import type { WizardStepKey } from "@/lib/supabase/types";
 import { brandStyles, industries } from "@/data/wizard";
 import type { ActionState } from "@/lib/forms/state";
+import type { Database } from "@/lib/supabase/types";
 
 /**
  * Server Actions for project + business-profile mutations.
@@ -299,4 +301,85 @@ export async function advanceWizardAction(formData: FormData): Promise<void> {
 
   revalidatePath("/");
   redirect(wizardPath(projectId, toStep));
+}
+
+// ---------------------------------------------------------------------------
+// Shopify Disconnect
+// ---------------------------------------------------------------------------
+
+/**
+ * Disconnects the Shopify connection for a project.
+ *
+ * Security invariants:
+ *   1. The user is read from the server session via `requireUser()`. The
+ *      projectId comes from the form data, but ownership is verified by
+ *      checking the project belongs to the session user BEFORE calling the
+ *      privileged revoke function.
+ *   2. The actual revocation uses the service-role client to call the
+ *      SECURITY DEFINER `revoke_connection_tokens` function, which:
+ *      - Deletes the Vault secret
+ *      - Clears all token metadata (expiry, lease state)
+ *      - Marks connection as disconnected
+ *      - Emits exactly one lifecycle event
+ *   3. Idempotent: repeated calls on the same project are no-ops.
+ *   4. Returns action state for UI feedback (success/error with message).
+ */
+export async function disconnectShopifyAction(
+  _prevState: ActionState,
+  formData: FormData,
+): Promise<ActionState | never> {
+  const user = await requireUser();
+
+  const projectId = String(formData.get("projectId") ?? "");
+  if (!isUuid(projectId)) {
+    return { status: "error", message: "We couldn't find that store." };
+  }
+
+  // Verify the project belongs to this user BEFORE calling the privileged function.
+  // This is a defense-in-depth check; the RPC also derives ownership from sp_projects.
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data: project, error: projectError } = await supabase
+      .from("sp_projects")
+      .select("id")
+      .eq("id", projectId)
+      .maybeSingle();
+
+    if (projectError) {
+      console.error("[disconnect] project lookup failed:", projectError.message);
+      return { status: "error", message: "We couldn't disconnect the store. Please try again." };
+    }
+    if (!project) {
+      return { status: "error", message: "We couldn't find that store." };
+    }
+  } catch (error) {
+    console.error("[disconnect] project lookup threw:", error);
+    return { status: "error", message: "We couldn't disconnect the store. Please try again." };
+  }
+
+  // Call the privileged revoke function via service-role client.
+  const serviceClient = getServiceRoleClient();
+  if (!serviceClient) {
+    console.error("[disconnect] service-role credential not configured");
+    return { status: "error", message: "We couldn't disconnect the store. Please try again." };
+  }
+
+  try {
+    const { error } = await serviceClient.rpc("revoke_connection_tokens", {
+      p_project_id: projectId,
+      p_reason: "disconnected",
+    });
+
+    if (error) {
+      console.error("[disconnect] revoke_connection_tokens failed:", error.message);
+      return { status: "error", message: "We couldn't disconnect the store. Please try again." };
+    }
+  } catch (error) {
+    console.error("[disconnect] revoke_connection_tokens threw:", error);
+    return { status: "error", message: "We couldn't disconnect the store. Please try again." };
+  }
+
+  revalidatePath("/");
+  revalidatePath(`/projects/${projectId}`, "layout");
+  redirect(wizardPath(projectId, "connect"));
 }

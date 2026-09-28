@@ -17,6 +17,7 @@ import { IndustryIcon } from "@/components/IndustryIcon";
 import {
   advanceWizardAction,
   saveBusinessProfileAction,
+  disconnectShopifyAction,
 } from "@/lib/projects/actions";
 import { idleState } from "@/lib/forms/state";
 import { nextStepId, prevStepId, wizardPath, stepIds } from "@/lib/wizard/steps";
@@ -202,11 +203,14 @@ function ConnectStep({
   oauthError: string | null;
 }) {
   const [shopInput, setShopInput] = useState("");
+  const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
   const normalized = shopInput.trim() ? normalizeShopDomain(shopInput) : null;
   const shopLooksInvalid = shopInput.trim().length > 0 && normalized === null;
 
   // Single source of truth: durable DB metadata, nothing else.
   const connected = connection.connected;
+
+  const [disconnectState, disconnectAction] = useActionState(disconnectShopifyAction, idleState);
 
   return (
     <div>
@@ -267,6 +271,16 @@ function ConnectStep({
           <>
             <StatusBadge label="✓ Shopify connected" tone="success" />
             <p className="text-sm text-[var(--sp-muted)]">{connection.shopDomain}</p>
+            <form action={disconnectAction} className="mt-4 w-full max-w-sm">
+              <input type="hidden" name="projectId" value={projectId} />
+              <button
+                type="button"
+                onClick={() => setShowDisconnectConfirm(true)}
+                className="w-full rounded-full border border-[var(--sp-border-strong)] bg-white dark:bg-[var(--sp-surface-raised)] px-4 py-2 text-sm font-medium text-[var(--sp-red-600)] dark:text-[var(--sp-red-400)] hover:bg-[var(--sp-red-50)] dark:hover:bg-[var(--sp-red-900)/20] transition-colors"
+              >
+                Disconnect
+              </button>
+            </form>
           </>
         ) : (
           <form
@@ -293,12 +307,53 @@ function ConnectStep({
         )}
       </div>
 
+      {showDisconnectConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setShowDisconnectConfirm(false)}>
+          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-[var(--sp-surface)] p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold">Disconnect Shopify store?</h3>
+            <p className="mt-2 text-sm text-[var(--sp-muted)]">
+              This will stop StorePilot from accessing <strong className="text-[var(--sp-fg)]">{connection.shopDomain}</strong>.
+            </p>
+            <ul className="mt-4 space-y-2 text-sm text-[var(--sp-muted)]">
+              <li>Stored StorePilot Shopify credentials will be removed.</li>
+              <li>Your existing Shopify store and products are <strong className="text-[var(--sp-fg)]">NOT</strong> deleted.</li>
+              <li>This does <strong className="text-[var(--sp-fg)]">NOT</strong> uninstall the Shopify app.</li>
+            </ul>
+            <form action={disconnectAction} className="mt-6">
+              <input type="hidden" name="projectId" value={projectId} />
+              <div className="flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowDisconnectConfirm(false)}
+                  className="rounded-full border border-[var(--sp-border)] px-4 py-2 text-sm font-medium hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={disconnectState.status === "pending"}
+                  className="rounded-full bg-[var(--sp-red-600)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--sp-red-700)] transition-colors disabled:opacity-50"
+                >
+                  {disconnectState.status === "pending" ? "Disconnecting…" : "Disconnect"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {oauthError ? (
         <div className="mt-4">
           <FormAlert tone="error">
             Shopify authorization couldn&apos;t be completed ({oauthError}). Please try
             again.
           </FormAlert>
+        </div>
+      ) : null}
+
+      {disconnectState.status === "error" && disconnectState.message ? (
+        <div className="mt-4">
+          <FormAlert tone="error">{disconnectState.message}</FormAlert>
         </div>
       ) : null}
 

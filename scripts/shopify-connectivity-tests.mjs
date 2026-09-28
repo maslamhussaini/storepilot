@@ -477,7 +477,10 @@ test("boundary: SUPABASE_SERVICE_ROLE_KEY is read in exactly one source file, an
     }
   };
   walk("src");
-  assert.deepEqual(readers, ["src/lib/shopify/tokens.ts"], "service-role key must be read only in tokens.ts");
+  // The service-role key is now read in a shared server-only module that both
+  // tokens.ts and actions.ts import. The security invariant (single reader,
+  // server-only) is preserved.
+  assert.deepEqual(readers, ["src/lib/supabase/service.ts"], "service-role key must be read only in the shared service module");
 });
 test("boundary: no NEXT_PUBLIC_ variant of the service-role key exists in source or env template", () => {
   const bad = [];
@@ -506,8 +509,9 @@ test("boundary: tokens.ts never returns token material — the persist operation
   assert.ok(/Promise<void>/.test(tokensCode), "storeShopifyTokens must be typed Promise<void>");
 });
 test("boundary: tokens.ts disables session persistence/refresh on the service client", () => {
-  assertSourceContains(TOKENS_MODULE, "persistSession: false", "no session persistence");
-  assertSourceContains(TOKENS_MODULE, "autoRefreshToken: false", "no auto token refresh");
+  // The service client is now created in the shared service module
+  assertSourceContains("src/lib/supabase/service.ts", "persistSession: false", "no session persistence");
+  assertSourceContains("src/lib/supabase/service.ts", "autoRefreshToken: false", "no auto token refresh");
 });
 test("boundary: log sanitization redacts token-shaped values before any server-side logging", () => {
   assertSourceContains(TOKENS_MODULE, "[redacted-jwt]", "JWT-shaped redaction");

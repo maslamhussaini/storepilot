@@ -10,7 +10,7 @@
  */
 
 export interface ActionState {
-  status: "idle" | "error" | "success";
+  status: "idle" | "pending" | "error" | "success";
   /** Form-level message, safe to show a merchant. Never a raw database error. */
   message?: string;
   /** Field-level errors, keyed by input `name`. */
