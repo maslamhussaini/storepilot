@@ -191,6 +191,28 @@ function StepNav({
 // the same row — never a query parameter, never sessionStorage. The
 // `oauthError` prop only ever renders a failure banner; no query parameter
 // can present a store as connected.
+//
+// RECONNECT (Phase 2B.3B-3D): an already-connected store gets a secondary
+// "Reconnect Shopify" control that posts the SAME authorize form the
+// disconnected branch below uses — same route, same requireUser() guard,
+// same ownership check, same signed state, same fixed-origin redirect_uri.
+// There is deliberately no second OAuth entry point and no dedicated
+// reconnect route.
+//
+// Reconnect does NOT disconnect first and does NOT touch connection state:
+// the form only carries `projectId` and the durable `connection.shopDomain`,
+// and the server decides what happens. In the database that is the idempotent
+// UPDATE branch of `store_connection_tokens`, which reuses the project's
+// active row, bumps the credential generation by one, and logs
+// `reconnected` — so the credential is rotated in place and no duplicate
+// connection row is created. Nothing about the merchant's Shopify store or
+// its products is deleted or modified; only StorePilot's own authorization
+// grant is replaced.
+//
+// Because the shop value is the server-supplied durable domain rather than
+// typed input, there is no client-side normalization step here — the route
+// re-validates it with `normalizeShopDomain` and fails closed with a generic
+// `invalid_shop` code if it is ever unusable.
 // ---------------------------------------------------------------------------
 
 function ConnectStep({
@@ -271,6 +293,21 @@ function ConnectStep({
           <>
             <StatusBadge label="✓ Shopify connected" tone="success" />
             <p className="text-sm text-[var(--sp-muted)]">{connection.shopDomain}</p>
+            <form
+              action="/api/shopify/authorize"
+              method="POST"
+              className="mt-4 w-full max-w-sm"
+            >
+              <input type="hidden" name="projectId" value={projectId} />
+              <input type="hidden" name="shop" value={connection.shopDomain ?? ""} />
+              <SubmitButton variant="secondary" pendingLabel="Redirecting to Shopify…">
+                Reconnect Shopify
+              </SubmitButton>
+            </form>
+            <p className="mt-2 text-xs text-[var(--sp-muted)]">
+              Reconnect if StorePilot loses access or you need to authorize Shopify
+              again. Your store and products are not affected.
+            </p>
             <form action={disconnectAction} className="mt-4 w-full max-w-sm">
               <input type="hidden" name="projectId" value={projectId} />
               <button

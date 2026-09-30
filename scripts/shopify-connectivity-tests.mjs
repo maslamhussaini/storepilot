@@ -792,6 +792,148 @@ test("Connect UI: form still posts to the real authorize endpoint with projectId
 });
 
 // ---------------------------------------------------------------------------
+// Connected-state Reconnect (Phase 2B.3B-3D)
+//
+// The backend already supported reauthorizing a store whose connection is
+// status='connected' — the idempotent UPDATE branch of
+// `store_connection_tokens` reuses the active row, bumps the credential
+// generation by exactly one, and logs `reconnected`. The only thing missing
+// was a merchant-facing control, because the connected branch of ConnectStep
+// rendered only the badge, the shop domain, and Disconnect. These are the
+// same source-inspection regression guards used for the Connect UI above
+// (see the section header comment for why there is no render/mount harness).
+//
+// The assertions are deliberately scoped to the CONNECTED branch and to the
+// Reconnect form in particular, because the file legitimately contains two
+// forms posting to the same authorize route (Connect and Reconnect) and two
+// separate server actions (`advanceWizardAction` and `disconnectAction`).
+// ---------------------------------------------------------------------------
+// Comment-stripped so the assertions below match CODE, not prose: the
+// ConnectStep doc block explains that Reconnect reuses the Connect form, and
+// any future edit that quotes the action string in that prose must not be
+// counted as an extra form.
+const wizardStepViewCode = stripComments(wizardStepViewState);
+const CONNECTED_BRANCH = between(
+  wizardStepViewCode,
+  "{connected ? (",
+  ") : (",
+  "connected branch of ConnectStep",
+);
+// The Reconnect form's own interior: from its authorize action up to its
+// closing tag. `between` searches forward from the match, so this cannot
+// spill into the Disconnect form that follows it.
+const RECONNECT_FORM = between(
+  CONNECTED_BRANCH,
+  'action="/api/shopify/authorize"',
+  "</form>",
+  "Reconnect form",
+);
+
+test("Reconnect: connected state exposes a Reconnect control", () => {
+  assert.ok(
+    CONNECTED_BRANCH.includes("Reconnect Shopify"),
+    "the connected branch must render a Reconnect control",
+  );
+  // Secondary, not the dominant primary action: `variant="secondary"` is what
+  // keeps the green primary gradient reserved for Continue in StepNav.
+  assert.ok(
+    RECONNECT_FORM.includes('variant="secondary"'),
+    "Reconnect must use the secondary variant, not the primary gradient",
+  );
+  assert.ok(
+    !RECONNECT_FORM.includes("sp-btn-primary"),
+    "Reconnect must never take the primary gradient class",
+  );
+});
+test("Reconnect: posts to the existing /api/shopify/authorize route", () => {
+  assertSourceContains(
+    WIZARD_STEP_VIEW,
+    'action="/api/shopify/authorize"',
+    "Reconnect must reuse the existing authorize route",
+  );
+  assert.ok(
+    RECONNECT_FORM.includes('method="POST"'),
+    "Reconnect must be a real form POST, not a client fetch",
+  );
+  assert.ok(
+    !wizardStepViewCode.includes('fetch("/api/shopify/authorize'),
+    "OAuth must stay server-initiated; the client must never fetch the route",
+  );
+});
+test("Reconnect: form carries projectId and the durable shop domain", () => {
+  assert.ok(
+    RECONNECT_FORM.includes('name="projectId" value={projectId}'),
+    "Reconnect must submit the project id",
+  );
+  assert.ok(
+    RECONNECT_FORM.includes('name="shop" value={connection.shopDomain ?? ""}'),
+    "Reconnect must submit the server-supplied durable shop domain, not free-typed input",
+  );
+});
+test("Reconnect: the existing Disconnect action remains available", () => {
+  assert.ok(
+    CONNECTED_BRANCH.includes("action={disconnectAction}"),
+    "Disconnect must survive the connected-state change",
+  );
+  assert.ok(CONNECTED_BRANCH.includes("setShowDisconnectConfirm(true)"), "Disconnect confirm trigger preserved");
+  // The confirm modal itself is rendered after the connected/disconnected
+  // ternary, so it is asserted at file scope rather than branch scope.
+  assert.ok(wizardStepViewState.includes("showDisconnectConfirm &&"), "Disconnect confirm modal still wired");
+  assertSourceContains(WIZARD_STEP_VIEW, "disconnectShopifyAction", "disconnect action import preserved");
+});
+test("Reconnect: never invokes the disconnect action or its confirmation", () => {
+  // The inverse of the test above, scoped to the Reconnect form only: this is
+  // what makes Reconnect a pure reauthorization and guarantees it cannot
+  // revoke the merchant's credential before Shopify returns a new grant.
+  for (const forbidden of ["disconnectAction", "disconnectShopifyAction", "setShowDisconnectConfirm"]) {
+    assert.ok(
+      !RECONNECT_FORM.includes(forbidden),
+      `Reconnect must not reference ${forbidden} — it must not touch connection state`,
+    );
+  }
+  assert.ok(
+    !wizardStepViewState.includes("revoke_connection_tokens"),
+    "the client must never reference the revoke RPC",
+  );
+});
+test("Reconnect: no second OAuth implementation was introduced", () => {
+  // Exactly two forms post to the authorize route — Connect and Reconnect —
+  // and both target the same single endpoint.
+  assert.equal(
+    countOccurrences(wizardStepViewCode, 'action="/api/shopify/authorize"'),
+    2,
+    "only the Connect form and the Reconnect form may post to the authorize route",
+  );
+  const shopifyApiRoutes = readdirSync("src/app/api/shopify", { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort();
+  assert.deepEqual(
+    shopifyApiRoutes,
+    ["authorize", "callback"],
+    "no reconnect (or any other new) API route may be added under src/app/api/shopify",
+  );
+  // The authorize route must remain the single place that builds the Shopify
+  // URL and the state cookie — reconnect adds UI, not authorization logic.
+  const authorizeCode = stripComments(readFileSync(AUTHORIZE_ROUTE, "utf8"));
+  assert.equal(
+    countOccurrences(authorizeCode, "new URL(`https://${shop}/admin/oauth/authorize`)"),
+    1,
+    "the Shopify authorize URL must still be built in exactly one place",
+  );
+  assert.equal(
+    countOccurrences(authorizeCode, "createOAuthStateCookieValue("),
+    1,
+    "OAuth state must still be signed in exactly one place",
+  );
+  // The server-side guards Reconnect now depends on must not have been relaxed.
+  assertSourceContains(AUTHORIZE_ROUTE, "requireUser()", "auth guard still required");
+  assertSourceContains(AUTHORIZE_ROUTE, "getProjectWithProfile(projectId)", "ownership check still required");
+  assertSourceContains(AUTHORIZE_ROUTE, "normalizeShopDomain(shopInput)", "shop validation still required");
+  assertSourceContains(AUTHORIZE_ROUTE, "`${env.appUrl}/api/shopify/callback`", "fixed-origin redirect_uri unchanged");
+});
+
+// ---------------------------------------------------------------------------
 // C7. Wizard global action UX cleanup (Phase 2B.3B-1.1)
 // ---------------------------------------------------------------------------
 test("wizard header action: AppShell conditionally omits the New Store form", () => {
