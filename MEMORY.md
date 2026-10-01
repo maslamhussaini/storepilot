@@ -2,15 +2,22 @@
 
 Verified project state only. No secrets, tokens, passwords, or service-role
 values belong in this file. Source of truth for the numbers below is the
-read-only production verification in `PHASE_2B_3B_3C_OAUTH_CUTOVER_EXECUTION_REPORT.txt`.
+read-only production verification in
+`PHASE_2B_3B_3D_POST_RECONNECT_VERIFICATION.txt`.
 
 ## Current phase
 
-Phase 2B.3B — Shopify OAuth hardening (token lifecycle, disconnect/reconnect,
-stable production origin). Current task: **2B.3B-3D, connected-state Reconnect
-UI.** The control is implemented and passes all local quality gates. Whether
-it is live in production is a moving target — treat "Next planned work" below
-as the authority on what still has to happen, not this sentence.
+**Phase 2B.3B-3D: PASS.** Reconnect UI shipped, deployed, and exercised once
+against production. Phase 2B.3B-3E (post-reconnect cleanup) is the task in
+flight. Next planned phase is 2C.
+
+3E in flight: the Disconnect confirmation modal's destructive button was
+present but **invisible** — `bg-[var(--sp-red-600)]` referenced a custom
+property `globals.css` never defined, so the background resolved to
+`transparent` under white text on a white dialog. Six design tokens
+(`--sp-red-50/400/600/700/900`, `--sp-fg`) were undefined and used in exactly
+one file. Fixed by defining them; a test now fails if the component references
+any `--sp-*` token that `globals.css` does not define. Not yet deployed.
 
 ## Production
 
@@ -22,8 +29,9 @@ as the authority on what still has to happen, not this sentence.
   trailing slash, no CR/LF, byte-verified). It was never the Cloudflare
   tunnel value — earlier reports that said otherwise were quoting the local
   `.env.local` value.
-- Local `.env.local` still holds the old tunnel URL. Local only; not loaded
-  in production. Not yet updated.
+- Local `.env.local` was updated in 3E: `SHOPIFY_APP_URL` now points at the
+  stable Vercel origin instead of the stale tunnel URL. One line changed; no
+  other variable touched. `.env.local` remains gitignored and untracked.
 
 ## Phase 2B.3B-3 implementation status
 
@@ -51,29 +59,55 @@ Shopify authorize/callback round trip** — not a repair, not a manual write.
 The `2 disconnected` and `3 reconnected` events are accurate audit records and
 must be retained, never deleted.
 
-## Royal Oud — verified baseline
+## Royal Oud — verified state AFTER the 3D reconnect (PASS)
 
-| Field | Value |
-| --- | --- |
-| shop | `0tsfz1-eg.myshopify.com` |
-| project | Royal Oud |
-| status | `connected` |
-| `credential_version` | 6 |
-| disconnected events | 2 |
-| reconnected events | 3 |
-| total lifecycle events | 8 |
-| connections rows for project | 1 |
-| linked credential secret | 1 |
-| orphan secrets | 0 |
-| refresh claim held | no |
+Read-only verification, 2026-09-30T21:01Z. Zero writes.
 
-Reconnect must move this to `credential_version` 7, reconnected 4, total 9,
-disconnected **unchanged at 2**, still 1 linked / 0 orphans.
+| Field | Before 3D | After 3D |
+| --- | --- | --- |
+| shop | `0tsfz1-eg.myshopify.com` | unchanged |
+| project | Royal Oud | unchanged |
+| status | `connected` | `connected` |
+| `credential_version` | 6 | **7** |
+| disconnected events | 2 | **2** (unchanged) |
+| reconnected events | 3 | **4** |
+| total lifecycle events | 8 | **9** |
+| connection rows | 1 | **1** (no duplicate) |
+| refresh claim held | no | **no** |
+| `disconnected_at` | null | null |
+| `granted_scopes` | `[]` | **`[]`** (still zero) |
+| `installed_at` | 2026-09-23T07:40:22Z | **unchanged** |
 
-> Disconnect-then-connect is NOT an acceptable substitute: it makes
-> `store_connection_tokens` take its INSERT branch, which resets
-> `credential_version` to 1, adds a `disconnected` event, and leaves a second
-> connection row. That is why 3D adds Reconnect instead.
+The human reconnect ran **exactly once**. Expected transition matched in full:
+`credential_version` +1, `reconnected` +1, `disconnected` unchanged, total +1,
+one row, one linked reference, no refresh claim.
+
+Three independent proofs that the intended code path ran, not a disconnect /
+reconnect cycle: `credential_version` is 7 and not 1 (the UPDATE branch, not
+INSERT); `installed_at` is bit-identical to the original install; and exactly
+one event exists after the previous verified newest event.
+
+Event metadata carries no credential material — the newest `reconnected` event
+holds only `{"shop_domain": "..."}`.
+
+### Disconnect confirmation modal was opened by accident
+
+The human opened the Disconnect confirmation modal afterwards and did **not**
+confirm it. **It caused zero mutation**: `disconnected` stayed 2, status stayed
+`connected`, `disconnected_at` stayed null, `credential_version` stayed 7. The
+trigger is `type="button"` and only sets local state, so it could not submit;
+the revoke lives in a separate server action inside the modal's own form.
+
+## Vault references — what is and is not verified
+
+- The connected row has **one non-null Vault reference**, resolving to exactly
+  one distinct `vault_secret_id`. No connected row lacks a reference.
+- A fresh **total** Vault secret count and a fresh **orphan** count were
+  **unavailable in the verification environment**: `vault.secrets` is not served
+  by PostgREST, no Supabase personal access token is present, `.env.local` has
+  no database password, and the Supabase MCP server is not reachable from the
+  agent toolset. Treat totals and orphans as **not measured**, not as zero.
+- No Vault plaintext was ever read or decrypted.
 
 ## Zero scopes
 
@@ -91,12 +125,16 @@ side effect of unrelated work.
 
 ## Next planned work
 
-1. Verify the 3D Reconnect control in the browser: confirm the Shopify consent
-   URL's `redirect_uri` is the stable Vercel callback, then approve once, then
-   re-check the Royal Oud baseline above.
-2. Only after that passes, request the **minimum Catalog scopes** and the
-   first real catalog import. Zero scopes is the blocker for any real catalog
-   work.
-3. Tidy-up candidates (not blockers): remove the obsolete trycloudflare
-   redirect URL from the Shopify dashboard once the new origin is proven;
-   update the stale tunnel URL in local `.env.local`.
+**Phase 2C — minimum Shopify Catalog scopes + first real catalog import.**
+Zero granted scopes is now the only blocker to any real catalog functionality.
+Reconnect and the stable origin are proven and must not be revisited.
+
+Remaining tidy-up, non-blocking:
+
+1. Remove the obsolete redirect URL from the Shopify dashboard, if it is still
+   listed: `https://kelkoo-ground-treo-clerk.trycloudflare.com/api/shopify/callback`.
+   Remove ONLY that entry, and only after confirming the stable Vercel callback
+   `https://storepilot-aslams-projects-6ad7cbd6.vercel.app/api/shopify/callback`
+   is present in the ACTIVE config version. Dashboard mutation needs human
+   browser access; the agent has none.
+2. Vault total/orphan counts remain unmeasurable from the agent environment.

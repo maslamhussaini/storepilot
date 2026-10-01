@@ -344,9 +344,14 @@ function ConnectStep({
         )}
       </div>
 
+      {/* `overflow-y-auto` on the overlay plus `my-auto` on the dialog is the
+          canonical fix for the flexbox centring overflow trap: a dialog taller
+          than the viewport used to overflow in BOTH directions, so its top was
+          unreachable above the viewport and its action row was clipped below the
+          fold. The destructive confirm must never be off-screen. */}
       {showDisconnectConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setShowDisconnectConfirm(false)}>
-          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-[var(--sp-surface)] p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/50 p-4" onClick={() => setShowDisconnectConfirm(false)}>
+          <div className="my-auto w-full max-w-md rounded-2xl bg-white dark:bg-[var(--sp-surface)] p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-lg font-semibold">Disconnect Shopify store?</h3>
             <p className="mt-2 text-sm text-[var(--sp-muted)]">
               This will stop StorePilot from accessing <strong className="text-[var(--sp-fg)]">{connection.shopDomain}</strong>.
@@ -366,12 +371,17 @@ function ConnectStep({
                 >
                   Cancel
                 </button>
+                {/* Destructive action. `type="submit"` inside the existing
+                    disconnectAction form — the ONLY path that can revoke.
+                    The solid red fill comes from --sp-red-600 (now a real token);
+                    the trigger text says "Disconnect", so the confirm is named
+                    "Disconnect Shopify" to say exactly what will happen. */}
                 <button
                   type="submit"
                   disabled={disconnectState.status === "pending"}
                   className="rounded-full bg-[var(--sp-red-600)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--sp-red-700)] transition-colors disabled:opacity-50"
                 >
-                  {disconnectState.status === "pending" ? "Disconnecting…" : "Disconnect"}
+                  {disconnectState.status === "pending" ? "Disconnecting…" : "Disconnect Shopify"}
                 </button>
               </div>
             </form>

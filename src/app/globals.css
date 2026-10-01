@@ -27,6 +27,19 @@
   --sp-border: rgba(10, 51, 36, 0.1);
   --sp-border-strong: rgba(10, 51, 36, 0.18);
   --sp-muted: #5b6f66;
+  --sp-fg: var(--foreground);
+
+  /* Destructive / danger scale. Referenced by the Disconnect confirmation
+     trigger and its destructive submit button. These MUST exist as real
+     custom properties: `bg-[var(--sp-red-600)]` against an undefined variable
+     is invalid at computed-value time, so the button silently falls back to
+     `transparent` and white text disappears on the white dialog. Red 600 on
+     white text is 4.83:1, which clears WCAG AA for normal-size text. */
+  --sp-red-50: #fef2f2;
+  --sp-red-400: #f87171;
+  --sp-red-600: #dc2626;
+  --sp-red-700: #b91c1c;
+  --sp-red-900: #7f1d1d;
 
   /* Gradients — defined here AND exposed as real .sp-* utility classes below,
      because Tailwind v4 cannot infer that an arbitrary background utility
@@ -54,6 +67,15 @@
     --sp-border: rgba(232, 250, 241, 0.12);
     --sp-border-strong: rgba(232, 250, 241, 0.2);
     --sp-muted: #9fb8ac;
+    /* Destructive text on the dark surface; red 400 on the raised dark surface
+       clears AA at 5.58:1, and the darker 900 is a hover tint rather than a
+       label. The destructive FILL stays red-600 on purpose: a lighter red
+       (#ef4444) drops white text to 3.76:1, under the 4.5:1 AA threshold. */
+    --sp-red-50: rgba(248, 113, 113, 0.12);
+    --sp-red-400: #f87171;
+    --sp-red-600: #dc2626;
+    --sp-red-700: #b91c1c;
+    --sp-red-900: #450a0a;
     --sp-gradient-soft: linear-gradient(135deg, rgba(167, 243, 208, 0.08) 0%, var(--sp-surface) 60%);
   }
 }

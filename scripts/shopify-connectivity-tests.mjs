@@ -934,6 +934,184 @@ test("Reconnect: no second OAuth implementation was introduced", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Disconnect confirmation modal (Phase 2B.3B-3E)
+//
+// A human screenshot showed the modal with a title, its warnings and Cancel,
+// but no visible destructive confirm. The button was PRESENT and enabled the
+// whole time: `bg-[var(--sp-red-600)]` referenced a custom property that
+// `globals.css` never defined. Per CSS, a `var()` reference to an undefined
+// custom property is invalid at computed-value time, so `background-color`
+// fell back to `transparent` and the button's white label rendered on the
+// white dialog — clickable, but not perceivable.
+//
+// The trigger looked fine because it used the same broken token as `color`
+// rather than `background-color`; an invalid `color` inherits, so it simply
+// rendered as ordinary dark text on `bg-white`.
+//
+// The first test below is the one that matters: it fails if any `var(--sp-*)`
+// referenced by the component is not actually defined, which is the defect
+// class itself rather than one instance of it.
+// ---------------------------------------------------------------------------
+const GLOBALS_CSS = readFileSync("src/app/globals.css", "utf8");
+const definedTokens = new Set(
+  [...GLOBALS_CSS.matchAll(/(--sp-[a-z0-9-]+)\s*:/g)].map((m) => m[1]),
+);
+// Sliced to the next sibling conditional, which is unambiguous: the modal
+// contains no `) : (` of its own.
+const DISCONNECT_MODAL = between(
+  wizardStepViewCode,
+  "{showDisconnectConfirm && (",
+  "{oauthError ? (",
+  "Disconnect confirmation modal",
+);
+const TRIGGER_FORM = between(
+  CONNECTED_BRANCH,
+  "<form action={disconnectAction}",
+  "</form>",
+  "connected-state Disconnect trigger form",
+);
+
+test("modal: every design token the component references is actually defined", () => {
+  // The root cause of the invisible destructive button. `bg-[var(--x)]` with an
+  // undefined --x silently degrades to `transparent`; `text-[var(--x)]` degrades
+  // to `inherit`. Neither throws, so only this check catches it.
+  const referenced = [...new Set([...wizardStepViewState.matchAll(/var\((--sp-[a-z0-9-]+)/g)].map((m) => m[1]))];
+  assert.ok(referenced.length > 0, "expected the component to reference design tokens");
+  for (const token of referenced) {
+    assert.ok(
+      definedTokens.has(token),
+      `${token} is referenced by the component but never defined in globals.css — ` +
+        `it resolves to transparent/inherit instead of its intended value`,
+    );
+  }
+  // Spelled out, because these are the two the defect actually hit.
+  assert.ok(definedTokens.has("--sp-red-600"), "--sp-red-600 must exist: it is the destructive button's fill");
+  assert.ok(definedTokens.has("--sp-fg"), "--sp-fg must exist: the modal's NOT warnings rely on it");
+});
+
+test("modal: the destructive confirm is a real, visible submit inside the existing action", () => {
+  assert.ok(
+    DISCONNECT_MODAL.includes('type="submit"'),
+    "the modal must contain an actual submit control",
+  );
+  assert.ok(
+    DISCONNECT_MODAL.includes("<form action={disconnectAction}"),
+    "the destructive control must post to the existing disconnectAction",
+  );
+  assert.ok(
+    DISCONNECT_MODAL.includes("Disconnect Shopify"),
+    "the destructive control must be labelled with what it does",
+  );
+  // The fill must come from a defined token and must not be transparent.
+  assert.ok(
+    /type="submit"[\s\S]{0,320}bg-\[var\(--sp-red-600\)\]/.test(DISCONNECT_MODAL),
+    "the destructive submit must carry the solid red fill",
+  );
+  // Exactly one submit, so there is no second, hidden revoke path.
+  assert.equal(
+    (DISCONNECT_MODAL.match(/type="submit"/g) || []).length,
+    1,
+    "the modal must expose exactly one destructive submit",
+  );
+  // Disabled only while the action is in flight.
+  assert.ok(
+    DISCONNECT_MODAL.includes('disabled={disconnectState.status === "pending"}'),
+    "the destructive submit must be disabled only while disconnecting",
+  );
+});
+
+test("modal: Cancel and the trigger never submit", () => {
+  // The trigger only opens the confirmation.
+  assert.ok(
+    TRIGGER_FORM.includes('type="button"'),
+    "the Disconnect trigger must be type=button so it cannot submit",
+  );
+  assert.ok(
+    TRIGGER_FORM.includes("setShowDisconnectConfirm(true)"),
+    "the trigger must only open the confirmation state",
+  );
+  assert.ok(
+    !TRIGGER_FORM.includes('type="submit"'),
+    "the trigger must never submit",
+  );
+  // Cancel only closes it. Sliced per button rather than by counted distance,
+  // so reformatting the markup cannot silently weaken this guard.
+  const modalButtons = [...DISCONNECT_MODAL.matchAll(/<button\b[\s\S]*?<\/button>/g)].map((m) => m[0]);
+  const cancel = modalButtons.find((b) => />\s*Cancel\s*<\/button>/.test(b));
+  assert.ok(cancel, "the modal must render a Cancel control");
+  assert.ok(cancel.includes('type="button"'), "Cancel must be type=button");
+  assert.ok(
+    cancel.includes("setShowDisconnectConfirm(false)"),
+    "Cancel must only close the modal, never mutate",
+  );
+  assert.ok(!cancel.includes('type="submit"'), "Cancel must never submit");
+  // Only the destructive control may submit.
+  const submitters = modalButtons.filter((b) => b.includes('type="submit"'));
+  assert.equal(submitters.length, 1, "only the destructive control may submit from the modal");
+});
+
+test("modal: actions cannot be clipped below the viewport", () => {
+  assert.ok(
+    /fixed inset-0[^\n]*overflow-y-auto/.test(DISCONNECT_MODAL),
+    "the overlay must scroll, or a tall dialog clips its action row",
+  );
+  assert.ok(
+    /className="my-auto[^\n]*max-w-md/.test(DISCONNECT_MODAL),
+    "the dialog needs my-auto so flex centring cannot overflow off the top",
+  );
+});
+
+test("modal: Reconnect stays independent and cannot reach disconnect", () => {
+  // The Reconnect control must neither open the modal nor submit anything.
+  for (const forbidden of ["showDisconnectConfirm", "disconnectAction", "type=\"submit\""]) {
+    assert.ok(
+      !RECONNECT_FORM.includes(forbidden),
+      `the Reconnect form must not reference ${forbidden}`,
+    );
+  }
+  assert.ok(
+    !RECONNECT_FORM.includes("setShowDisconnectConfirm"),
+    "Reconnect must not open the Disconnect confirmation",
+  );
+});
+
+test("modal: no second disconnect implementation was introduced", () => {
+  // disconnectShopifyAction is imported once and is the only revoke path.
+  assert.equal(
+    (wizardStepViewState.match(/disconnectShopifyAction/g) || []).length,
+    2,
+    "expected exactly one import and one wiring of disconnectShopifyAction",
+  );
+  assert.ok(
+    wizardStepViewState.includes("useActionState(disconnectShopifyAction"),
+    "the disconnect action must still be the server action, not a fetch",
+  );
+  assert.ok(
+    !wizardStepViewState.includes('fetch("/api/'),
+    "no client fetch may stand in for a server action",
+  );
+  // Every form in the component posts one of the four pre-existing targets:
+// the OAuth route, the disconnect action, the wizard advance, and the
+// business-profile action's dispatch. Nothing new may appear.
+  const actions = [...wizardStepViewState.matchAll(/<form[^>]*action=\{\{?"?([^"}\s]+)/g)].map((m) => m[1]);
+  const allowed = new Set([
+    "/api/shopify/authorize",
+    "disconnectAction",
+    "advanceWizardAction",
+    "formAction", // useActionState dispatch for saveBusinessProfileAction
+  ]);
+  for (const a of actions) {
+    assert.ok(allowed.has(a), `unexpected form action introduced: ${a}`);
+  }
+  // The destructive path is still exactly the two disconnectAction forms.
+  assert.equal(
+    (wizardStepViewState.match(/action=\{disconnectAction\}/g) || []).length,
+    2,
+    "expected the trigger form and the modal form, and no third revoke path",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // C7. Wizard global action UX cleanup (Phase 2B.3B-1.1)
 // ---------------------------------------------------------------------------
 test("wizard header action: AppShell conditionally omits the New Store form", () => {
